@@ -1,5 +1,5 @@
 """
-Telegram bot powered by Hugging Face's Inference API (Qwen2.5-0.5B-Instruct).
+Telegram bot powered by Hugging Face's Inference API (Qwen2.5-7B-Instruct).
 Hosted on Render as a webhook-based FastAPI service.
 
 Flow:
@@ -38,18 +38,31 @@ HF_API_TOKEN = os.environ.get("HF_API_TOKEN")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 HF_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+# Which backend serves the model. "auto" lets Hugging Face pick a provider
+# that supports HF_MODEL (supported since huggingface_hub 1.x; older
+# versions such as 0.30.x crash with "Provider 'auto' not supported").
+# Set HF_PROVIDER explicitly (e.g. "hf-inference", "novita", "together")
+# only if you want to force a specific backend.
+HF_PROVIDER = (os.environ.get("HF_PROVIDER") or "auto").strip()
 
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("Missing TELEGRAM_BOT_TOKEN environment variable.")
 if not HF_API_TOKEN:
     raise ValueError("Missing HF_API_TOKEN environment variable.")
 
-# Hugging Face client. As of the newer "Inference Providers" system, HF
-# routes chat_completion calls through one of several backend providers
-# (e.g. hf-inference, together, novita). Passing provider="auto" lets HF
-# pick a provider that actually supports the requested model - omitting
-# it, or using a model no provider supports, causes failures.
-hf_client = InferenceClient(provider="auto", api_key=HF_API_TOKEN)
+# Hugging Face client. With provider="auto" HF routes each request to a
+# backend provider that actually supports the requested model.
+hf_client = InferenceClient(provider=HF_PROVIDER, api_key=HF_API_TOKEN)
+
+# Safety net: a free Hugging Face account may not have access to every
+# third-party provider that "auto" can pick. HF's own serverless API
+# ("hf-inference") is always available with a token, so we fall back to it
+# when the primary provider fails.
+fallback_client = (
+    InferenceClient(provider="hf-inference", api_key=HF_API_TOKEN)
+    if HF_PROVIDER != "hf-inference"
+    else None
+)
 
 # ---------------------------------------------------------------------------
 # Telegram handlers
@@ -69,24 +82,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_text = update.message.text
     logger.info("Received message: %s", user_text)
 
-    try:
-        # chat.completions.create expects a list of {"role": ..., "content": ...}
-        # messages, same shape as OpenAI-style chat APIs. `model` must be passed
-        # here since the client itself no longer pins a single model.
-        response = hf_client.chat.completions.create(
-            model=HF_MODEL,
-            messages=[{"role": "user", "content": user_text}],
-            max_tokens=300,
-        )
-        reply_text = response.choices[0].message.content
+    # Try the primary provider first, then fall back to HF's serverless API.
+    reply_text = None
+    for client in (hf_client, fallback_client):
+        if client is None:
+            continue
+        try:
+            # chat.completions.create expects a list of {"role": ..., "content": ...}
+            # messages, same shape as OpenAI-style chat APIs.
+            response = client.chat.completions.create(
+                model=HF_MODEL,
+                messages=[{"role": "user", "content": user_text}],
+                max_tokens=300,
+            )
+            reply_text = response.choices[0].message.content
+            break
+        except Exception as exc:  # noqa: BLE001 - we want to catch and report any failure
+            # Common causes: rate limiting, an invalid/expired HF token, the
+            # provider not supporting this model, or a network hiccup. The
+            # full exception is logged so you can check Render's logs
+            # (Render dashboard -> your service -> Logs) for the exact reason.
+            logger.error(
+                "Hugging Face API call failed (provider=%s): %s",
+                client.provider,
+                exc,
+                exc_info=True,
+            )
 
-    except Exception as exc:  # noqa: BLE001 - we want to catch and report any failure
-        # Common causes: model still "warming up" on HF's servers, network hiccup,
-        # rate limiting, an invalid/expired HF token, or a model not supported
-        # by any inference provider. The full exception is logged so you can
-        # check Render's logs (Render dashboard -> your service -> Logs) for
-        # the exact reason.
-        logger.error("Hugging Face API call failed: %s", exc, exc_info=True)
+    if reply_text is None:
         reply_text = (
             "Sorry, I couldn't reach the AI model just now "
             "(it may still be loading or there was a network issue). "
@@ -134,7 +157,7 @@ async def on_shutdown() -> None:
 @app.get("/")
 async def health_check():
     """Simple health check endpoint so you can confirm the service is up."""
-    return {"status": "ok", "model": HF_MODEL}
+    return {"status": "ok", "model": HF_MODEL, "provider": HF_PROVIDER}
 
 
 @app.post("/webhook/{token}")
