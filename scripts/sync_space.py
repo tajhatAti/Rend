@@ -11,7 +11,7 @@ from huggingface_hub import HfApi, create_repo
 
 ROOT = Path(__file__).resolve().parents[1]
 SPACE_DIR = ROOT / "space"
-REPO_ID = (os.environ.get("HF_SPACE_ID") or "madarauchihagmailcom/image-bot").strip()
+REPO_ID = (os.environ.get("HF_SPACE_ID") or "madarauchihagmailcom/My").strip()
 TOKEN = (os.environ.get("HF_TOKEN") or os.environ.get("HF_API_TOKEN") or "").strip()
 MESSAGE = os.environ.get("SYNC_MESSAGE") or "sync Space from GitHub"
 
@@ -40,6 +40,7 @@ def main() -> int:
         commit_message=MESSAGE,
         allow_patterns=["*.py", "*.txt", "*.md", "*.json", "*.yaml", "*.yml"],
         ignore_patterns=["**/__pycache__/**", "**/*.pyc"],
+        delete_patterns=["**/*.py", "**/*.txt", "**/*.md"],
     )
     print(f"Synced {SPACE_DIR} -> https://huggingface.co/spaces/{REPO_ID}")
     return 0

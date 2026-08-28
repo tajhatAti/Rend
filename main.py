@@ -34,7 +34,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 HF_SPACE_ID = (
     os.environ.get("HF_SPACE_ID")
     or os.environ.get("HF_SPACE_URL")
-    or "madarauchihagmailcom/image-bot"
+    or "madarauchihagmailcom/My"
 ).strip()
 HF_API_TOKEN = (os.environ.get("HF_API_TOKEN") or "").strip() or None
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")

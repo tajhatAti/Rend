@@ -9,7 +9,8 @@ app_file: app.py
 pinned: false
 ---
 
-Your own image API for the Telegram bot.
+Backend for the Telegram image bot.
 
-Upload this folder to a new Hugging Face Space, then set
-`HF_SPACE_ID=your-username/your-space` on Render.
+APIs: `/caption` `/ocr` `/detect` `/bg`
+
+This replaces the old lyrics app on this Space.
