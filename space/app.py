@@ -143,5 +143,6 @@ with gr.Blocks(title="Image Bot Space") as demo:
         bg_btn.click(remove_bg, inputs=image, outputs=bg_out, api_name="bg")
 
 
+demo.queue()
 if __name__ == "__main__":
-    demo.queue().launch()
+    demo.launch()

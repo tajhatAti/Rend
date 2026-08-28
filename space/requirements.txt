@@ -1,4 +1,6 @@
 gradio==4.44.1
+# Newer pydantic emits bool additionalProperties; Gradio 4.44 then 500s on /gradio_api/info
+pydantic==2.10.6
 transformers==4.44.2
 accelerate==0.34.2
 pillow==10.4.0
