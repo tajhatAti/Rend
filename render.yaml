@@ -7,8 +7,14 @@ services:
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: TELEGRAM_BOT_TOKEN
-        sync: false   # Telegram BotFather token
-      - key: HF_SPACE_ID
-        value: madarauchihagmailcom/My
+        sync: false
       - key: HF_API_TOKEN
-        sync: false   # only if the Space is private
+        sync: false   # optional; helps Space rate limits
+      - key: SPACE_FLUX
+        value: black-forest-labs/FLUX.1-schnell
+      - key: SPACE_VISION
+        value: gokaygokay/Florence-2
+      - key: SPACE_BG
+        value: not-lain/background-removal
+      - key: SPACE_STYLE
+        value: timbrooks/instruct-pix2pix
