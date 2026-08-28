@@ -3,3 +3,4 @@ uvicorn[standard]==0.30.6
 python-telegram-bot==21.6
 huggingface_hub==1.29.0
 python-dotenv==1.0.1
+gradio_client==1.8.0

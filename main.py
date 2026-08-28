@@ -1,29 +1,34 @@
 """
-Telegram bot: Render handles webhooks, Groq runs the model (free tier).
+Telegram bot on Render that calls a Hugging Face Space (the actual model).
+
+Why Render sits in the middle
+-----------------------------
+Telegram talks to *your* server. Your server talks to the Space.
+Users never call Hugging Face from Telegram, so Space URLs / tokens stay
+server-side. This is the normal pattern — it does not skip Hugging Face
+rate limits or billing; the Space still enforces its own queue.
 
 Flow:
-    Telegram user -> Telegram -> Render (this app) -> Groq API
-    -> Render -> Telegram -> user
+    Telegram user
+      -> Telegram servers
+      -> Render (this webhook)
+      -> Hugging Face Space (Gradio API: chat / image / audio / …)
+      -> Render
+      -> Telegram
+      -> user
 
-Why this, not Hugging Face or self-hosting?
-- Hugging Face free credits are ~$0.10/month and already exhausted (402).
-- Render free has no GPU and ~512MB RAM — it cannot run a 7B model.
-- Hugging Face Inference Endpoints / GPU Spaces cost real money.
-- Groq gives a real free API (no GPU needed on our side).
-
-Why webhooks instead of polling?
-Render's free web service sleeps when idle. Webhooks wake it only when
-Telegram POSTs a new message.
+Optional: GROQ_API_KEY is only a text-chat fallback if no Space is set.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 from fastapi import FastAPI, Request
-from huggingface_hub import InferenceClient
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -38,124 +43,124 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+# Space id like "username/my-space"  OR a full https://….hf.space URL
+HF_SPACE_ID = (os.environ.get("HF_SPACE_ID") or os.environ.get("HF_SPACE_URL") or "").strip()
+HF_SPACE_API = (os.environ.get("HF_SPACE_API") or "/predict").strip()
+HF_API_TOKEN = (os.environ.get("HF_API_TOKEN") or "").strip() or None
 GROQ_API_KEY = (os.environ.get("GROQ_API_KEY") or "").strip()
-HF_API_TOKEN = (os.environ.get("HF_API_TOKEN") or "").strip()
+GROQ_MODEL = (os.environ.get("GROQ_MODEL") or "openai/gpt-oss-20b").strip()
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
-# Groq shut down llama-3.1-8b-instant on 2026-08-16; gpt-oss-20b is current.
-GROQ_MODEL = (os.environ.get("GROQ_MODEL") or "openai/gpt-oss-20b").strip()
-HF_MODEL = (os.environ.get("HF_MODEL") or "openai/gpt-oss-20b").strip()
-_CLIENT_TIMEOUT = 30
+_IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_AUDIO_EXT = {".wav", ".mp3", ".ogg", ".flac", ".m4a", ".opus"}
 
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("Missing TELEGRAM_BOT_TOKEN environment variable.")
-if not GROQ_API_KEY and not HF_API_TOKEN:
+if not HF_SPACE_ID and not GROQ_API_KEY:
     raise ValueError(
-        "Set GROQ_API_KEY (recommended, free at https://console.groq.com/keys) "
-        "or HF_API_TOKEN."
+        "Set HF_SPACE_ID to your Hugging Face Space (username/space-name) "
+        "or GROQ_API_KEY as a text-chat fallback."
     )
 
-# Groq is the primary brain. Hugging Face is only a leftover fallback —
-# free HF credits are tiny and this project already hit 402 Payment Required.
-groq_client: Optional[InferenceClient] = None
-if GROQ_API_KEY:
-    groq_client = InferenceClient(
+_space_client = None
+
+
+def _get_space_client():
+    """Connect once. Hugging Face Spaces sleep; first connect may take a minute."""
+    global _space_client
+    if _space_client is not None:
+        return _space_client
+    from gradio_client import Client
+
+    logger.info("Connecting to Hugging Face Space %s …", HF_SPACE_ID)
+    _space_client = Client(HF_SPACE_ID, hf_token=HF_API_TOKEN, verbose=False)
+    try:
+        logger.info("Space API:\n%s", _space_client.view_api(return_format="str"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not list Space API: %s", exc)
+    return _space_client
+
+
+def _call_space(user_text: str) -> Any:
+    client = _get_space_client()
+    return client.predict(user_text, api_name=HF_SPACE_API)
+
+
+def _classify_payload(result: Any) -> tuple[str, str]:
+    """Turn a Gradio return value into ('text'|'photo'|'audio', value)."""
+    if isinstance(result, (list, tuple)):
+        result = next((item for item in result if item not in (None, "")), result[0] if result else "")
+    if isinstance(result, dict):
+        result = (
+            result.get("url")
+            or result.get("path")
+            or result.get("value")
+            or result.get("text")
+            or result.get("content")
+            or str(result)
+        )
+
+    value = result if isinstance(result, str) else str(result)
+    lower = value.lower().split("?", 1)[0]
+    path = Path(value)
+
+    if path.exists():
+        ext = path.suffix.lower()
+        if ext in _IMAGE_EXT:
+            return "photo", value
+        if ext in _AUDIO_EXT:
+            return "audio", value
+        return "text", value
+
+    if any(lower.endswith(ext) for ext in _IMAGE_EXT):
+        return "photo", value
+    if any(lower.endswith(ext) for ext in _AUDIO_EXT):
+        return "audio", value
+    return "text", value
+
+
+def _call_groq(user_text: str) -> str:
+    from huggingface_hub import InferenceClient
+
+    client = InferenceClient(
         base_url="https://api.groq.com/openai/v1",
         api_key=GROQ_API_KEY,
-        timeout=_CLIENT_TIMEOUT,
+        timeout=30,
     )
-
-hf_client: Optional[InferenceClient] = None
-if HF_API_TOKEN:
-    hf_client = InferenceClient(
-        provider="groq",
-        api_key=HF_API_TOKEN,
-        timeout=_CLIENT_TIMEOUT,
-    )
-
-# ---------------------------------------------------------------------------
-# Inference helpers
-# ---------------------------------------------------------------------------
-
-
-def _http_status(exc: BaseException) -> Optional[int]:
-    status = getattr(exc, "status_code", None)
-    if isinstance(status, int):
-        return status
-    response = getattr(exc, "response", None)
-    if response is not None:
-        code = getattr(response, "status_code", None)
-        if isinstance(code, int):
-            return code
-    text = str(exc)
-    for code in (401, 402, 403, 404, 429, 503):
-        if str(code) in text:
-            return code
-    return None
-
-
-def _complete(client: InferenceClient, model: str, user_text: str) -> str:
     response = client.chat.completions.create(
-        model=model,
+        model=GROQ_MODEL,
         messages=[{"role": "user", "content": user_text}],
         max_tokens=300,
     )
-    content = response.choices[0].message.content
-    return content or ""
+    return response.choices[0].message.content or ""
 
 
-def _user_error_message(status: Optional[int], *, used_groq: bool) -> str:
-    if not GROQ_API_KEY:
-        return (
-            "The bot has no Groq API key yet, and Hugging Face free credits "
-            "are used up. Add GROQ_API_KEY on Render:\n"
-            "1) Open https://console.groq.com/keys (free Google login)\n"
-            "2) Create an API key\n"
-            "3) Render → your service → Environment → GROQ_API_KEY = that key\n"
-            "4) Save and wait for the redeploy"
-        )
-    if status == 401:
-        which = "Groq" if used_groq else "Hugging Face"
-        return (
-            f"{which} rejected the API key (401). Check GROQ_API_KEY on Render "
-            "(https://console.groq.com/keys)."
-        )
-    if status == 429:
-        return "The AI provider is rate-limiting us. Please try again in a moment."
-    if status == 402:
-        return (
-            "Hugging Face credits are exhausted. This bot should be using Groq "
-            "instead — make sure GROQ_API_KEY is set on Render."
-        )
-    return (
-        "Sorry, I couldn't reach the AI model just now. Please try again in a moment."
-    )
-
-
-def generate_reply(user_text: str) -> str:
-    last_status: Optional[int] = None
-    used_groq = False
-
-    if groq_client is not None:
-        used_groq = True
+def run_backend(user_text: str) -> tuple[str, str]:
+    """Preferred: Hugging Face Space. Fallback: Groq text chat."""
+    if HF_SPACE_ID:
         try:
-            reply = _complete(groq_client, GROQ_MODEL, user_text)
-            logger.info("Groq reply ok (model=%s)", GROQ_MODEL)
-            return reply
+            raw = _call_space(user_text)
+            kind, payload = _classify_payload(raw)
+            logger.info("Space reply ok (kind=%s)", kind)
+            return kind, payload
         except Exception as exc:  # noqa: BLE001
-            last_status = _http_status(exc) or last_status
-            logger.error("Groq API call failed (model=%s): %s", GROQ_MODEL, exc, exc_info=True)
+            logger.error("Hugging Face Space call failed: %s", exc, exc_info=True)
+            if not GROQ_API_KEY:
+                return (
+                    "text",
+                    "Could not reach the Hugging Face Space. It may be sleeping "
+                    "or HF_SPACE_API does not match the Space's endpoint. "
+                    f"Check Render logs. ({exc.__class__.__name__})",
+                )
 
-    if hf_client is not None:
+    if GROQ_API_KEY:
         try:
-            reply = _complete(hf_client, HF_MODEL, user_text)
-            logger.info("HF reply ok (model=%s)", HF_MODEL)
-            return reply
+            return "text", _call_groq(user_text)
         except Exception as exc:  # noqa: BLE001
-            last_status = _http_status(exc) or last_status
-            logger.error("Hugging Face API call failed (model=%s): %s", HF_MODEL, exc, exc_info=True)
+            logger.error("Groq call failed: %s", exc, exc_info=True)
+            return "text", "Sorry, I couldn't reach the AI model just now. Please try again."
 
-    return _user_error_message(last_status, used_groq=used_groq)
+    return "text", "No backend configured. Set HF_SPACE_ID on Render."
 
 
 # ---------------------------------------------------------------------------
@@ -163,17 +168,40 @@ def generate_reply(user_text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+async def _send_result(update: Update, kind: str, payload: str) -> None:
+    message = update.message
+    if kind == "photo":
+        path = Path(payload)
+        if path.exists():
+            with path.open("rb") as handle:
+                await message.reply_photo(photo=handle)
+            return
+        await message.reply_photo(photo=payload)
+        return
+    if kind == "audio":
+        path = Path(payload)
+        if path.exists():
+            with path.open("rb") as handle:
+                await message.reply_voice(voice=handle)
+            return
+        await message.reply_voice(voice=payload)
+        return
+    await message.reply_text(payload[:4000] or "(empty response)")
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    backend = f"Hugging Face Space `{HF_SPACE_ID}`" if HF_SPACE_ID else "Groq"
     await update.message.reply_text(
-        "Hi! Send me any message and I'll reply using an open-source AI model."
+        f"Hi! Send me a message and I'll run it on {backend}."
     )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_text = update.message.text
     logger.info("Received message: %s", user_text)
-    reply_text = generate_reply(user_text)
-    await update.message.reply_text(reply_text)
+    await update.message.chat.send_action(action="typing")
+    kind, payload = await asyncio.to_thread(run_backend, user_text)
+    await _send_result(update, kind, payload)
 
 
 # ---------------------------------------------------------------------------
@@ -192,10 +220,10 @@ async def on_startup() -> None:
     await telegram_app.initialize()
     await telegram_app.start()
     logger.info(
-        "Telegram application started. groq=%s hf=%s model=%s",
-        bool(groq_client),
-        bool(hf_client),
-        GROQ_MODEL if groq_client else HF_MODEL,
+        "Telegram application started. space=%s api=%s groq=%s",
+        HF_SPACE_ID or "(none)",
+        HF_SPACE_API,
+        bool(GROQ_API_KEY),
     )
     if RENDER_EXTERNAL_URL:
         logger.info(
@@ -215,19 +243,29 @@ async def on_shutdown() -> None:
 async def health_check():
     return {
         "status": "ok",
-        "backend": "groq" if groq_client else "huggingface",
-        "model": GROQ_MODEL if groq_client else HF_MODEL,
-        "groq_configured": bool(groq_client),
-        "hf_configured": bool(hf_client),
+        "space": HF_SPACE_ID or None,
+        "space_api": HF_SPACE_API if HF_SPACE_ID else None,
+        "groq_fallback": bool(GROQ_API_KEY),
     }
 
 
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request):
+    """
+    Return 200 immediately so Telegram does not retry while the Space
+    is waking up (cold start can take 30–60s).
+    """
     if token != TELEGRAM_BOT_TOKEN:
         return {"error": "unauthorized"}, 403
 
     data = await request.json()
     update = Update.de_json(data, telegram_app.bot)
-    await telegram_app.process_update(update)
+
+    async def _process() -> None:
+        try:
+            await telegram_app.process_update(update)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to process Telegram update")
+
+    asyncio.create_task(_process())
     return {"status": "ok"}

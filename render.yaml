@@ -8,9 +8,11 @@ services:
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false   # Telegram BotFather token
-      - key: GROQ_API_KEY
-        sync: false   # free key from https://console.groq.com/keys  ← required
-      - key: GROQ_MODEL
-        value: openai/gpt-oss-20b
+      - key: HF_SPACE_ID
+        sync: false   # e.g. username/my-space  ← the Space Render will call
+      - key: HF_SPACE_API
+        value: /predict   # Gradio endpoint; change if the Space uses /chat etc.
       - key: HF_API_TOKEN
-        sync: false   # optional leftover; HF free credits are already exhausted
+        sync: false   # needed only if the Space is private
+      - key: GROQ_API_KEY
+        sync: false   # optional text-chat fallback
