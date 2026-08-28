@@ -281,11 +281,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # python-telegram-bot + FastAPI webhook
 # ---------------------------------------------------------------------------
 
+# FileExtension takes one string in PTB 21, not a list.
 _AUDIO_FILTER = (
     filters.VOICE
     | filters.AUDIO
     | filters.Document.AUDIO
-    | filters.Document.FileExtension(["mp3", "m4a", "wav", "flac", "ogg", "aac", "opus", "oga"])
+    | filters.Document.FileExtension("mp3")
+    | filters.Document.FileExtension("m4a")
+    | filters.Document.FileExtension("wav")
+    | filters.Document.FileExtension("flac")
+    | filters.Document.FileExtension("ogg")
+    | filters.Document.FileExtension("aac")
+    | filters.Document.FileExtension("opus")
+    | filters.Document.FileExtension("oga")
 )
 
 telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
