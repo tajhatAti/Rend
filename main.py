@@ -1,5 +1,5 @@
 """
-Telegram bot powered by Hugging Face Inference Providers (Qwen2.5-7B-Instruct).
+Telegram bot powered by Hugging Face Inference Providers.
 Hosted on Render as a webhook-based FastAPI service.
 
 Flow:
@@ -43,46 +43,64 @@ GROQ_API_KEY = (os.environ.get("GROQ_API_KEY") or "").strip()
 # Used only to log/confirm the webhook target; not required for the app to run.
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
-HF_MODEL = (os.environ.get("HF_MODEL") or "Qwen/Qwen2.5-7B-Instruct").strip()
-GROQ_MODEL = (os.environ.get("GROQ_MODEL") or "llama-3.1-8b-instant").strip()
+# Qwen2.5-7B-Instruct is NOT on Groq, and on this account it is "not supported
+# by any provider you have enabled" (HF 400). Groq *is* enabled, and Groq's
+# Hugging Face catalog is gpt-oss-20b / gpt-oss-120b.
+_DEFAULT_MODEL = "openai/gpt-oss-20b"
+_DEFAULT_PROVIDER = "groq"
+# llama-3.1-8b-instant was shut down on Groq on 2026-08-16.
+_DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 
-# Chat LLMs are served by partner providers (Featherless, Groq, Together, …),
-# NOT by Hugging Face's own "hf-inference" serverless API.
-#
-# As of July 2025, hf-inference is CPU-oriented (embeddings, classification,
-# BERT/GPT-2). Calling it for Qwen2.5-7B-Instruct hits
-#   https://router.huggingface.co/hf-inference/models/Qwen/Qwen2.5-7B-Instruct/v1/chat/completions
-# and returns HTTP 403 Forbidden.
-#
-# Qwen2.5-7B-Instruct is hosted by Featherless AI (and "auto" should pick it).
-# Never fall back to hf-inference for this model.
+HF_MODEL = (os.environ.get("HF_MODEL") or _DEFAULT_MODEL).strip()
+HF_PROVIDER = (os.environ.get("HF_PROVIDER") or _DEFAULT_PROVIDER).strip()
+GROQ_MODEL = (os.environ.get("GROQ_MODEL") or _DEFAULT_GROQ_MODEL).strip()
+
 _HF_INFERENCE_ALIASES = {"hf-inference", "hf_inference", "huggingface"}
-# Featherless AI is the provider that actually hosts Qwen2.5-7B-Instruct.
-# "auto" is next in case HF remaps the model later.
-_CHAT_PROVIDERS = ("featherless-ai", "auto", "groq")
+# Models we already know will 400 on this setup — skip them instead of wasting
+# a webhook round-trip.
+_UNAVAILABLE_MODELS = {
+    "Qwen/Qwen2.5-7B-Instruct",
+    "Qwen/Qwen2.5-7B-Instruct-1M",
+}
 _CLIENT_TIMEOUT = 30
 
 
-def _provider_chain() -> list[str]:
-    """Providers to try, in order. Explicit HF_PROVIDER (if set) goes first."""
-    requested = (os.environ.get("HF_PROVIDER") or "").strip()
-    chain: list[str] = []
+def _routes() -> list[tuple[str, str]]:
+    """(provider, model) pairs to try, in order."""
+    routes: list[tuple[str, str]] = []
 
-    if requested:
-        if requested.lower() in _HF_INFERENCE_ALIASES:
-            logger.warning(
-                "HF_PROVIDER=%s does not serve chat model %s (that combination "
-                "returns HTTP 403). Using auto / partner providers instead.",
-                requested,
-                HF_MODEL,
-            )
-        else:
-            chain.append(requested)
+    requested_model = HF_MODEL
+    requested_provider = HF_PROVIDER
 
-    for provider in _CHAT_PROVIDERS:
-        if provider not in chain:
-            chain.append(provider)
-    return chain
+    if requested_model in _UNAVAILABLE_MODELS:
+        logger.warning(
+            "HF_MODEL=%s is not served by any provider enabled on this Hugging "
+            "Face account (and Groq does not host it). Using %s instead.",
+            requested_model,
+            _DEFAULT_MODEL,
+        )
+        requested_model = _DEFAULT_MODEL
+        requested_provider = _DEFAULT_PROVIDER
+
+    if requested_provider.lower() in _HF_INFERENCE_ALIASES:
+        logger.warning(
+            "HF_PROVIDER=%s does not host chat LLMs. Using %s instead.",
+            requested_provider,
+            _DEFAULT_PROVIDER,
+        )
+        requested_provider = _DEFAULT_PROVIDER
+
+    routes.append((requested_provider, requested_model))
+
+    for provider, model in (
+        ("groq", "openai/gpt-oss-20b"),
+        ("auto", "openai/gpt-oss-20b"),
+        ("groq", "openai/gpt-oss-120b"),
+    ):
+        pair = (provider, model)
+        if pair not in routes:
+            routes.append(pair)
+    return routes
 
 
 if not TELEGRAM_BOT_TOKEN:
@@ -90,22 +108,23 @@ if not TELEGRAM_BOT_TOKEN:
 if not HF_API_TOKEN:
     raise ValueError("Missing HF_API_TOKEN environment variable.")
 
-HF_PROVIDERS = _provider_chain()
+ROUTES = _routes()
 
-# One client per provider. Created once at import time so we don't rebuild
-# HTTP sessions on every Telegram message.
-hf_clients: list[tuple[str, InferenceClient]] = [
-    (
-        provider,
-        InferenceClient(provider=provider, api_key=HF_API_TOKEN, timeout=_CLIENT_TIMEOUT),
-    )
-    for provider in HF_PROVIDERS
+_provider_clients: dict[str, InferenceClient] = {}
+for provider, _model in ROUTES:
+    if provider not in _provider_clients:
+        _provider_clients[provider] = InferenceClient(
+            provider=provider,
+            api_key=HF_API_TOKEN,
+            timeout=_CLIENT_TIMEOUT,
+        )
+
+hf_attempts: list[tuple[str, str, InferenceClient]] = [
+    (provider, model, _provider_clients[provider]) for provider, model in ROUTES
 ]
 
 groq_client: Optional[InferenceClient] = None
 if GROQ_API_KEY:
-    # Direct Groq OpenAI-compatible API — billed against Groq's free tier,
-    # not Hugging Face credits.
     groq_client = InferenceClient(
         base_url="https://api.groq.com/openai/v1",
         api_key=GROQ_API_KEY,
@@ -131,6 +150,8 @@ def _http_status(exc: BaseException) -> Optional[int]:
     for code in (401, 402, 403, 404, 429, 503):
         if str(code) in text:
             return code
+    if "bad request" in text.lower() or "model_not_supported" in text.lower():
+        return 400
     return None
 
 
@@ -144,6 +165,19 @@ def _is_token_permission_error(exc: BaseException) -> bool:
             "make calls to inference providers",
             "invalid username or password",
             "invalid token",
+        )
+    )
+
+
+def _is_model_unavailable(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(
+        needle in text
+        for needle in (
+            "model_not_supported",
+            "not supported by any provider",
+            "not supported by provider",
+            "is not supported",
         )
     )
 
@@ -164,19 +198,18 @@ def _user_error_message(status: Optional[int]) -> str:
         )
     if status == 403:
         return (
-            "Hugging Face returned 403 Forbidden. Two common causes:\n"
-            "1) Fine-grained tokens need the permission "
-            "\"Make calls to Inference Providers\" — create a new token at "
-            "https://huggingface.co/settings/tokens with that box checked "
-            "(or use a classic Read token), then update HF_API_TOKEN on Render.\n"
-            "2) Don't set HF_PROVIDER=hf-inference — that provider does not "
-            f"host {HF_MODEL}."
+            "Hugging Face returned 403 Forbidden. Fine-grained tokens need "
+            "the permission \"Make calls to Inference Providers\" — create a "
+            "new token at https://huggingface.co/settings/tokens with that "
+            "box checked (or use a classic Read token), then update "
+            "HF_API_TOKEN on Render."
         )
-    if status == 404:
+    if status in (400, 404):
         return (
-            f"No Inference Provider currently hosts {HF_MODEL} (404). "
-            "Set HF_MODEL on Render to a model that is served, e.g. "
-            "Qwen/Qwen3-4B-Instruct-2507, or add GROQ_API_KEY."
+            "None of the configured models are available on the Inference "
+            "Providers enabled for this Hugging Face account. Enable more "
+            "providers at https://huggingface.co/settings/inference-providers "
+            "or set GROQ_API_KEY on Render."
         )
     if status == 429:
         return "The AI provider is rate-limiting us right now. Please try again in a moment."
@@ -198,29 +231,30 @@ def _complete(client: InferenceClient, model: str, user_text: str) -> str:
 
 
 def generate_reply(user_text: str) -> str:
-    """Try Hugging Face partner providers, then optional Groq."""
+    """Try Hugging Face (provider, model) routes, then optional Groq."""
     last_status: Optional[int] = None
 
-    for provider, client in hf_clients:
+    for provider, model, client in hf_attempts:
         try:
-            reply = _complete(client, HF_MODEL, user_text)
-            logger.info("HF reply ok (provider=%s, model=%s)", provider, HF_MODEL)
+            reply = _complete(client, model, user_text)
+            logger.info("HF reply ok (provider=%s, model=%s)", provider, model)
             return reply
         except Exception as exc:  # noqa: BLE001
             last_status = _http_status(exc) or last_status
             logger.error(
                 "Hugging Face API call failed (provider=%s, model=%s, status=%s): %s",
                 provider,
-                HF_MODEL,
+                model,
                 last_status,
                 exc,
                 exc_info=True,
             )
-            # Auth failures are account-wide. A 403 aimed at hf-inference
-            # (wrong provider) is not — keep trying partner providers.
             if last_status == 401 or _is_token_permission_error(exc):
                 break
-            if last_status == 403 and "hf-inference" not in str(exc).lower():
+            # Wrong model / provider combo — try the next route.
+            if last_status in (400, 404) or _is_model_unavailable(exc):
+                continue
+            if last_status == 403:
                 break
 
     if groq_client is not None:
@@ -243,7 +277,7 @@ def generate_reply(user_text: str) -> str:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles the /start command."""
     await update.message.reply_text(
-        "Hi! I'm a test bot powered by Qwen2.5 (via Hugging Face). "
+        "Hi! I'm a test bot powered by open-source models via Hugging Face. "
         "Send me any message and I'll reply using the AI model."
     )
 
@@ -277,9 +311,8 @@ async def on_startup() -> None:
     await telegram_app.initialize()
     await telegram_app.start()
     logger.info(
-        "Telegram application started. model=%s providers=%s groq=%s",
-        HF_MODEL,
-        HF_PROVIDERS,
+        "Telegram application started. routes=%s groq=%s",
+        ROUTES,
         bool(groq_client),
     )
     if RENDER_EXTERNAL_URL:
@@ -301,8 +334,7 @@ async def health_check():
     """Simple health check endpoint so you can confirm the service is up."""
     return {
         "status": "ok",
-        "model": HF_MODEL,
-        "providers": HF_PROVIDERS,
+        "routes": [{"provider": p, "model": m} for p, m in ROUTES],
         "groq_fallback": bool(groq_client),
     }
 

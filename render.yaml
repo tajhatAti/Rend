@@ -11,6 +11,6 @@ services:
       - key: HF_API_TOKEN
         sync: false   # Hugging Face token with "Make calls to Inference Providers"
       - key: HF_MODEL
-        value: Qwen/Qwen2.5-7B-Instruct
+        value: openai/gpt-oss-20b
       - key: HF_PROVIDER
-        value: featherless-ai   # do NOT set hf-inference — that provider 403s this model
+        value: groq   # Groq is enabled on this account; it does not host Qwen2.5-7B
