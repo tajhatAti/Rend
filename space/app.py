@@ -15,6 +15,16 @@ from functools import lru_cache
 import gradio as gr
 from PIL import Image, ImageDraw, ImageFont
 
+try:
+    import spaces
+except ImportError:  # local / plain CPU Space
+    class spaces:  # type: ignore[no-redef]
+        @staticmethod
+        def GPU(fn=None, **_kwargs):
+            if fn is None:
+                return lambda f: f
+            return fn
+
 def _rgb(image: Image.Image) -> Image.Image:
     if image.mode != "RGB":
         return image.convert("RGB")
@@ -44,6 +54,7 @@ def _detector():
     return pipeline("object-detection", model="facebook/detr-resnet-50")
 
 
+@spaces.GPU
 def caption(image: Image.Image) -> str:
     if image is None:
         return "No image."
@@ -53,6 +64,7 @@ def caption(image: Image.Image) -> str:
     return str(result)
 
 
+@spaces.GPU
 def ocr(image: Image.Image) -> str:
     if image is None:
         return "No image."
@@ -62,6 +74,7 @@ def ocr(image: Image.Image) -> str:
     return processor.batch_decode(ids, skip_special_tokens=True)[0]
 
 
+@spaces.GPU
 def detect(image: Image.Image):
     if image is None:
         return None, "No image."
