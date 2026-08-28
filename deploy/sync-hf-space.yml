@@ -1,0 +1,42 @@
+# Copy this file to .github/workflows/sync-hf-space.yml in the GitHub UI
+# (Settings-less: Code → .github/workflows → Create file).
+# The GitHub App used by Arena cannot create workflow files itself.
+#
+# Then: GitHub → Settings → Secrets and variables → Actions
+#   HF_TOKEN = Hugging Face WRITE token (https://huggingface.co/settings/tokens)
+
+name: Sync Hugging Face Space
+
+on:
+  push:
+    paths:
+      - "space/**"
+      - "scripts/sync_space.py"
+      - ".github/workflows/sync-hf-space.yml"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install huggingface_hub
+        run: pip install -q "huggingface_hub>=0.25.0"
+
+      - name: Upload space/ to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE_ID: madarauchihagmailcom/image-bot
+          SYNC_MESSAGE: sync Space from GitHub
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "Add GitHub secret HF_TOKEN = a Hugging Face WRITE token"
+            echo "https://huggingface.co/settings/tokens"
+            exit 1
+          fi
+          python scripts/sync_space.py
