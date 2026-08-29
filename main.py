@@ -1,8 +1,7 @@
 """
 Telegram → Render → your Hugging Face Space → Render → Telegram.
 
-Photo tools run on the Space GPU. Imagine / video / i2v are online APIs
-the Space calls (Pollinations) — they are not loaded on the free GPU.
+FLUX.1-schnell, photo tools, and lyrics all run through YOUR Space.
 """
 
 from __future__ import annotations
@@ -48,28 +47,26 @@ HF_API_TOKEN = (os.environ.get("HF_API_TOKEN") or "").strip() or None
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 _MAX_DOWNLOAD_BYTES = 19 * 1024 * 1024
 
-_PHOTO_MODES = {"caption", "ocr", "bg", "detect", "sketch", "i2v"}
-_PROMPT_MODES = {"imagine", "video"}
+_PHOTO_MODES = {"caption", "ocr", "bg", "detect", "sketch"}
+_PROMPT_MODES = {"imagine", "lyrics"}
 _ALL_MODES = _PHOTO_MODES | _PROMPT_MODES
 
 _BTN_MODE = {
     "✨ Imagine": "imagine",
-    "🎬 Video": "video",
+    "🎵 Lyrics": "lyrics",
     "🖼 Describe": "caption",
     "🔤 OCR": "ocr",
     "📦 Detect": "detect",
     "🪄 No BG": "bg",
     "✏️ Sketch": "sketch",
-    "🎞 Photo→Video": "i2v",
 }
 
 MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("✨ Imagine"), KeyboardButton("🎬 Video")],
+        [KeyboardButton("✨ Imagine"), KeyboardButton("🎵 Lyrics")],
         [KeyboardButton("🖼 Describe"), KeyboardButton("🔤 OCR")],
         [KeyboardButton("📦 Detect"), KeyboardButton("🪄 No BG")],
-        [KeyboardButton("✏️ Sketch"), KeyboardButton("🎞 Photo→Video")],
-        [KeyboardButton("📋 Menu")],
+        [KeyboardButton("✏️ Sketch"), KeyboardButton("📋 Menu")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -79,7 +76,7 @@ INLINE_MENU = InlineKeyboardMarkup(
     [
         [
             InlineKeyboardButton("✨ Imagine", callback_data="mode:imagine"),
-            InlineKeyboardButton("🎬 Video", callback_data="mode:video"),
+            InlineKeyboardButton("🎵 Lyrics", callback_data="mode:lyrics"),
         ],
         [
             InlineKeyboardButton("🖼 Describe", callback_data="mode:caption"),
@@ -89,30 +86,26 @@ INLINE_MENU = InlineKeyboardMarkup(
             InlineKeyboardButton("📦 Detect", callback_data="mode:detect"),
             InlineKeyboardButton("🪄 No BG", callback_data="mode:bg"),
         ],
-        [
-            InlineKeyboardButton("✏️ Sketch", callback_data="mode:sketch"),
-            InlineKeyboardButton("🎞 Photo→Video", callback_data="mode:i2v"),
-        ],
+        [InlineKeyboardButton("✏️ Sketch", callback_data="mode:sketch")],
     ]
 )
 
 START_HTML = (
     "<b>Image Bot</b>\n"
     "Telegram → Render → your Space → you.\n\n"
-    "<b>Create (online APIs)</b>\n"
-    "✨ Imagine — text → image\n"
-    "🎬 Video — prompt → short clip\n"
-    "🎞 Photo→Video — still → clip\n\n"
-    "<b>On your Space (ZeroGPU)</b>\n"
+    "<b>Create</b>\n"
+    "✨ Imagine — FLUX.1-schnell on your ZeroGPU\n"
+    "🎵 Lyrics — song name (lrclib, via your Space)\n\n"
+    "<b>Photo tools</b>\n"
     "🖼 Describe · 🔤 OCR · 📦 Detect · 🪄 No BG · ✏️ Sketch\n\n"
-    "<i>Type a prompt to generate an image.\n"
-    "Send a photo to run the selected tool.</i>"
+    "<i>Type a prompt for FLUX, a song name for lyrics,\n"
+    "or send a photo for the selected tool.\n"
+    "First FLUX run downloads the model — can take a few minutes.</i>"
 )
 
 MODE_HINT = {
     "imagine": "Send a prompt.\nExample: a tea stall in Rangpur rain, cinematic",
-    "video": "Send a prompt.\nExample: drone shot over a river at golden hour",
-    "i2v": "Send a photo. Caption = motion (or I will use a slow camera move).",
+    "lyrics": "Send a song name.\nExample: Shape of You",
     "caption": "Send a photo — I will describe it.",
     "ocr": "Send a photo with text to read.",
     "detect": "Send a photo — I will box objects.",
@@ -220,28 +213,15 @@ def call_imagine(prompt: str) -> tuple[str, str]:
     path = _as_path(result)
     text = _as_text(result)
     if not path:
-        raise RuntimeError(text or "Imagine returned no image")
+        raise RuntimeError(text or "FLUX returned no image")
     return path, text
 
 
-def call_video(prompt: str) -> tuple[str, str]:
-    result = _predict(prompt, api_name="/video")
-    path = _as_path(result)
-    text = _as_text(result)
-    if not path:
-        raise RuntimeError(text or "Video returned no file")
-    return path, text
-
-
-def call_i2v(image_path: str, prompt: str) -> tuple[str, str]:
-    from gradio_client import handle_file
-
-    result = _predict(handle_file(image_path), prompt or "", api_name="/i2v")
-    path = _as_path(result)
-    text = _as_text(result)
-    if not path:
-        raise RuntimeError(text or "Image-to-video returned no file")
-    return path, text
+def call_lyrics(query: str) -> str:
+    text = _as_text(_predict(query, api_name="/lyrics"))
+    if not text:
+        raise RuntimeError("No lyrics came back")
+    return text
 
 
 async def _reply_long(message, text: str) -> None:
@@ -272,20 +252,6 @@ async def _send_image(message, path: str, caption: str = "", as_document: bool =
         await message.reply_photo(photo=path, caption=caption or None, reply_markup=MENU_KEYBOARD)
         return
     await message.reply_text(caption or "No image file came back.", reply_markup=MENU_KEYBOARD)
-
-
-async def _send_video(message, path: str, caption: str = "") -> None:
-    p = Path(path)
-    if p.exists():
-        with p.open("rb") as handle:
-            await message.reply_video(
-                video=handle,
-                caption=caption[:900] or None,
-                supports_streaming=True,
-                reply_markup=MENU_KEYBOARD,
-            )
-        return
-    await message.reply_text(caption or "No video file came back.", reply_markup=MENU_KEYBOARD)
 
 
 async def _download_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -322,24 +288,9 @@ def _photo_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
         return "detect"
     if caption in {"sketch", "pencil", "/sketch"} or caption.startswith("sketch"):
         return "sketch"
-    if caption in {"video", "i2v", "animate", "/video", "/i2v"} or caption.startswith("video"):
-        return "i2v"
     if caption in {"caption", "describe", "/caption"}:
         return "caption"
     return saved if saved in _PHOTO_MODES else "caption"
-
-
-def _i2v_prompt(update: Update) -> str:
-    caption = (update.message.caption or "").strip()
-    low = caption.lower()
-    for prefix in ("video", "i2v", "animate", "/video", "/i2v"):
-        if low == prefix:
-            return ""
-        if low.startswith(prefix + " "):
-            return caption.split(None, 1)[1].strip()
-    if low in {"ocr", "bg", "detect", "sketch", "caption", "describe"}:
-        return ""
-    return caption
 
 
 async def _send_menu(message) -> None:
@@ -368,7 +319,7 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     raw = update.message.text or ""
     cmd = raw.split()[0].lstrip("/").split("@")[0]
     rest = raw.split(None, 1)[1].strip() if len(raw.split(None, 1)) > 1 else ""
-    if cmd == "menu" or cmd == "help":
+    if cmd in {"menu", "help"}:
         await _send_menu(update.message)
         return
     if cmd not in _ALL_MODES:
@@ -384,7 +335,7 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    data = (query.data or "")
+    data = query.data or ""
     if data.startswith("mode:"):
         mode = data.split(":", 1)[1]
         if mode in _ALL_MODES:
@@ -398,22 +349,22 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _run_prompt(message, mode: str, prompt: str) -> None:
     await message.reply_text(
-        f"Working ({mode})… this can take up to a couple of minutes.",
+        f"Working ({mode})… first FLUX run can take a few minutes.",
         reply_markup=MENU_KEYBOARD,
     )
     try:
-        if mode == "video":
-            await message.chat.send_action(action="upload_video")
-            path, note = await asyncio.to_thread(call_video, prompt)
-            await _send_video(message, path, caption=note or "video")
+        if mode == "lyrics":
+            await message.chat.send_action(action="typing")
+            text = await asyncio.to_thread(call_lyrics, prompt)
+            await _reply_long(message, text)
             return
         await message.chat.send_action(action="upload_photo")
         path, note = await asyncio.to_thread(call_imagine, prompt)
-        await _send_image(message, path, caption=note or "imagine")
+        await _send_image(message, path, caption=note or "FLUX")
     except Exception as exc:  # noqa: BLE001
         logger.exception("Prompt call failed (%s)", mode)
         await message.reply_text(
-            f"Could not generate ({mode}).\n({exc.__class__.__name__}: {exc})",
+            f"Could not finish ({mode}).\n({exc.__class__.__name__}: {exc})",
             reply_markup=MENU_KEYBOARD,
         )
 
@@ -452,12 +403,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             out = await asyncio.to_thread(call_sketch, tmp_path)
             await _send_image(update.message, out, caption="sketch")
             return
-        if mode == "i2v":
-            await update.message.chat.send_action(action="upload_video")
-            prompt = _i2v_prompt(update)
-            path, note = await asyncio.to_thread(call_i2v, tmp_path, prompt)
-            await _send_video(update.message, path, caption=note or "photo→video")
-            return
         if mode == "detect":
             await update.message.chat.send_action(action="upload_photo")
             text, image = await asyncio.to_thread(call_detect, tmp_path)
@@ -486,7 +431,7 @@ telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 telegram_app.add_handler(CommandHandler("start", start_command))
 telegram_app.add_handler(CommandHandler("help", start_command))
 telegram_app.add_handler(CommandHandler("menu", start_command))
-for _cmd in ("caption", "ocr", "detect", "bg", "sketch", "imagine", "video", "i2v"):
+for _cmd in ("caption", "ocr", "detect", "bg", "sketch", "imagine", "lyrics"):
     telegram_app.add_handler(CommandHandler(_cmd, mode_command))
 telegram_app.add_handler(CallbackQueryHandler(on_button))
 telegram_app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
@@ -503,9 +448,8 @@ async def on_startup() -> None:
         await telegram_app.bot.set_my_commands(
             [
                 BotCommand("start", "Open the menu"),
-                BotCommand("imagine", "Text → image"),
-                BotCommand("video", "Prompt → video"),
-                BotCommand("i2v", "Photo → video"),
+                BotCommand("imagine", "FLUX text → image"),
+                BotCommand("lyrics", "Song name → lyrics"),
                 BotCommand("caption", "Describe a photo"),
                 BotCommand("ocr", "Read text in a photo"),
                 BotCommand("detect", "Find objects"),
@@ -537,14 +481,13 @@ async def health_check():
         "status": "ok",
         "space": HF_SPACE_ID,
         "apis": [
+            "/imagine",
             "/caption",
             "/ocr",
             "/detect",
             "/bg",
             "/sketch",
-            "/imagine",
-            "/video",
-            "/i2v",
+            "/lyrics",
         ],
     }
 

@@ -1,16 +1,15 @@
 """
-Image API on YOUR Hugging Face Space.
+Image + lyrics API on YOUR Hugging Face Space.
 
-Local ZeroGPU:  /caption /ocr /detect /bg /sketch
-Online APIs:    /imagine /video /i2v   (Pollinations — not run on this GPU)
+On this ZeroGPU: /caption /ocr /detect /bg /sketch /imagine (FLUX.1-schnell)
+Lyrics lookup:   /lyrics  (lrclib.net, no GPU)
 """
 
 from __future__ import annotations
 
 import io
-import os
+import json
 import random
-import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -36,52 +35,6 @@ def _rgb(image: Image.Image) -> Image.Image:
     return image
 
 
-def _pollinations_key() -> str:
-    return (
-        os.environ.get("POLLINATIONS_KEY")
-        or os.environ.get("POLLINATIONS_API_KEY")
-        or ""
-    ).strip()
-
-
-def _http_get(url: str, timeout: int = 180) -> bytes:
-    key = _pollinations_key()
-    if key and "key=" not in url:
-        join = "&" if "?" in url else "?"
-        url = f"{url}{join}key={urllib.parse.quote(key)}"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 ImageBot",
-            "Accept": "image/*,video/*,*/*",
-            "Referer": "https://pollinations.ai/",
-        },
-    )
-    if key:
-        req.add_header("Authorization", f"Bearer {key}")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
-            ctype = (resp.headers.get("Content-Type") or "").lower()
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", "replace")[:400]
-        raise RuntimeError(f"HTTP {exc.code}: {body or exc.reason}") from exc
-    if data[:1] in (b"{", b"<") or "application/json" in ctype or "text/html" in ctype:
-        text = data.decode("utf-8", "replace")[:400]
-        raise RuntimeError(text or f"Unexpected {ctype}")
-    if not data or len(data) < 32:
-        raise RuntimeError("Empty response from API")
-    return data
-
-
-def _is_image(data: bytes) -> bool:
-    return data[:8] == b"\x89PNG\r\n\x1a\n" or data[:3] == b"\xff\xd8\xff" or data[:4] == b"RIFF"
-
-
-def _is_mp4(data: bytes) -> bool:
-    return b"ftyp" in data[:64]
-
-
 @lru_cache(maxsize=1)
 def _captioner():
     from transformers import pipeline
@@ -103,6 +56,17 @@ def _detector():
     from transformers import pipeline
 
     return pipeline("object-detection", model="facebook/detr-resnet-50")
+
+
+@lru_cache(maxsize=1)
+def _flux():
+    import torch
+    from diffusers import FluxPipeline
+
+    return FluxPipeline.from_pretrained(
+        "black-forest-labs/FLUX.1-schnell",
+        torch_dtype=torch.bfloat16,
+    )
 
 
 @spaces.GPU
@@ -172,7 +136,6 @@ def sketch(image: Image.Image):
     gray = ImageOps.grayscale(rgb)
     inverted = ImageOps.invert(gray)
     blur = inverted.filter(ImageFilter.GaussianBlur(radius=18))
-    # Color dodge: min(255, gray * 255 / (255 - blur))
     gpx = gray.load()
     bpx = blur.load()
     out = Image.new("L", gray.size)
@@ -188,156 +151,69 @@ def sketch(image: Image.Image):
     return out.convert("RGB"), "pencil sketch"
 
 
+@spaces.GPU(duration=120)
 def imagine(prompt: str):
     text = (prompt or "").strip()
     if not text:
         return None, "Type a prompt."
-    text = text[:800]
-    q = urllib.parse.quote(text)
-    seed = random.randint(1, 2_000_000_000)
-    # image.pollinations.ai currently only serves Sana and 400s on flux/safe/nologo.
-    urls = [
-        f"https://image.pollinations.ai/prompt/{q}",
-        f"https://image.pollinations.ai/prompt/{q}?model=sana&seed={seed}",
-        f"https://gen.pollinations.ai/image/{q}?model=dreamshaper&width=1024&height=1024&seed={seed}",
-        f"https://gen.pollinations.ai/image/{q}?model=zimage&width=1024&height=1024&seed={seed}",
-        f"https://gen.pollinations.ai/image/{q}?model=flux&width=1024&height=1024&seed={seed}",
-    ]
-    last = "no attempt"
-    for url in urls:
-        host = url.split("/")[2]
-        try:
-            data = _http_get(url, timeout=120)
-            if not _is_image(data):
-                last = f"{host}: not an image"
-                continue
-            img = Image.open(io.BytesIO(data))
-            img.load()
-            return img.convert("RGB"), f"image via {host}"
-        except Exception as exc:  # noqa: BLE001
-            last = f"{host}: {exc}"
-    hint = ""
-    if not _pollinations_key():
-        hint = " Add Space secret POLLINATIONS_KEY from enter.pollinations.ai if this keeps failing."
-    return None, f"Text-to-image failed. {last}.{hint}"
+    import torch
+
+    pipe = _flux()
+    if torch.cuda.is_available():
+        pipe.to("cuda")
+    image = pipe(
+        text[:500],
+        guidance_scale=0.0,
+        num_inference_steps=4,
+        max_sequence_length=256,
+        height=768,
+        width=768,
+        generator=torch.Generator("cpu").manual_seed(random.randint(1, 2_000_000_000)),
+    ).images[0]
+    return image, "FLUX.1-schnell"
 
 
-def _write_mp4(data: bytes) -> str:
-    fd, path = tempfile.mkstemp(suffix=".mp4")
-    os.close(fd)
-    with open(path, "wb") as handle:
-        handle.write(data)
-    return path
-
-
-def make_video(prompt: str):
-    text = (prompt or "").strip()
+def lyrics(query: str) -> str:
+    text = (query or "").strip()
     if not text:
-        return None, "Type a prompt."
-    text = text[:500]
-    q = urllib.parse.quote(text)
-    last = "no attempt"
-    queries = [
-        f"https://gen.pollinations.ai/video/{q}?duration=4&resolution=480p&aspectRatio=16:9",
-        f"https://gen.pollinations.ai/video/{q}?model=seedance-2.0-fast&duration=4&resolution=480p",
-    ]
-    for url in queries:
-        try:
-            data = _http_get(url, timeout=180)
-            if not _is_mp4(data):
-                last = "response was not mp4"
-                continue
-            return _write_mp4(data), "Pollinations video"
-        except Exception as exc:  # noqa: BLE001
-            last = str(exc)
-    hint = ""
-    if not _pollinations_key():
-        hint = (
-            " Video models are not free-anonymous. "
-            "Add a free key from enter.pollinations.ai as Space secret POLLINATIONS_KEY."
-        )
-    return None, f"Prompt-to-video failed. {last}.{hint}"
-
-
-def image_to_video(image: Image.Image, prompt: str):
-    if image is None:
-        return None, "No image."
-    text = (prompt or "").strip() or "slow cinematic camera move, natural motion"
-    text = text[:500]
-    q = urllib.parse.quote(text)
-    # Pollinations i2v wants a public image URL. We only have pixels here, so
-    # skip third-party hosts and ask for a key + media upload when available.
-    key = _pollinations_key()
-    if not key:
-        return None, (
-            "Image-to-video needs a public frame URL. "
-            "Add a free POLLINATIONS_KEY on the Space (enter.pollinations.ai), "
-            "or use /video with a text prompt instead."
-        )
-    buf = io.BytesIO()
-    frame = _rgb(image)
-    frame.thumbnail((768, 768))
-    frame.save(buf, format="JPEG", quality=85)
-    raw = buf.getvalue()
-    boundary = "----ImageBotBoundary"
-    body = (
-        f"--{boundary}\r\n"
-        'Content-Disposition: form-data; name="file"; filename="frame.jpg"\r\n'
-        "Content-Type: image/jpeg\r\n\r\n"
-    ).encode() + raw + f"\r\n--{boundary}--\r\n".encode()
-    req = urllib.request.Request(
-        "https://media.pollinations.ai/upload",
-        data=body,
-        method="POST",
-        headers={
-            "User-Agent": "ImageBot/1.0",
-            "Authorization": f"Bearer {key}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-        },
-    )
+        return "Type a song name."
+    url = "https://lrclib.net/api/search?q=" + urllib.parse.quote(text[:200])
+    req = urllib.request.Request(url, headers={"User-Agent": "ImageBot/1.0"})
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            uploaded = resp.read().decode("utf-8", "replace").strip()
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
-        body_txt = exc.read().decode("utf-8", "replace")[:300]
-        return None, f"Could not upload frame (HTTP {exc.code}): {body_txt or exc.reason}"
+        return f"Lyrics lookup failed (HTTP {exc.code})."
     except Exception as exc:  # noqa: BLE001
-        return None, f"Could not upload frame: {exc}"
-
-    frame_url = uploaded
-    if uploaded.startswith("{"):
-        if "http" in uploaded:
-            start = uploaded.find("http")
-            end = start
-            while end < len(uploaded) and uploaded[end] not in "\"' <>":
-                end += 1
-            frame_url = uploaded[start:end]
-        else:
-            return None, f"Upload did not return a URL: {uploaded[:200]}"
-    if not frame_url.startswith("http"):
-        frame_url = f"https://media.pollinations.ai/{uploaded.strip('/')}"
-
-    url = (
-        f"https://gen.pollinations.ai/video/{q}"
-        f"?duration=4&resolution=480p&aspectRatio=16:9"
-        f"&image={urllib.parse.quote(frame_url, safe='')}"
-    )
-    try:
-        data = _http_get(url, timeout=180)
-        if not _is_mp4(data):
-            return None, "Video API did not return mp4."
-        return _write_mp4(data), "Pollinations image→video"
-    except Exception as exc:  # noqa: BLE001
-        return None, f"Image-to-video failed: {exc}"
+        return f"Lyrics lookup failed: {exc}"
+    if not isinstance(data, list) or not data:
+        return f"No lyrics found for “{text}”."
+    for item in data:
+        body = (item or {}).get("plainLyrics") or (item or {}).get("syncedLyrics")
+        if not body:
+            continue
+        track = item.get("trackName") or text
+        artist = item.get("artistName") or "Unknown"
+        out = f"🎵 {track} — {artist}\n\n{body}"
+        return out if len(out) < 8000 else out[:7900] + "\n\n…"
+    return f"No lyrics found for “{text}”."
 
 
 with gr.Blocks(title="Image Bot Space") as demo:
     gr.Markdown(
         "# Image Bot Space\n"
-        "Telegram backend. **On this GPU:** caption, OCR, detect, background, sketch. "
-        "**Online APIs (not this GPU):** `/imagine` `/video` `/i2v` via Pollinations."
+        "Telegram backend. **FLUX.1-schnell** on this ZeroGPU for `/imagine`. "
+        "Photo tools: `/caption` `/ocr` `/detect` `/bg` `/sketch`. "
+        "Lyrics: `/lyrics` via lrclib."
     )
     image = gr.Image(type="pil", label="Image")
+
+    with gr.Tab("Imagine"):
+        pr = gr.Textbox(label="Prompt", placeholder="a tea stall in Rangpur rain, cinematic")
+        im_out = gr.Image(type="pil", label="FLUX")
+        im_txt = gr.Textbox(label="Status")
+        im_btn = gr.Button("Generate with FLUX")
+        im_btn.click(imagine, inputs=pr, outputs=[im_out, im_txt], api_name="imagine")
 
     with gr.Tab("Caption"):
         cap_out = gr.Textbox(label="Caption")
@@ -366,26 +242,11 @@ with gr.Blocks(title="Image Bot Space") as demo:
         sk_btn = gr.Button("Sketch")
         sk_btn.click(sketch, inputs=image, outputs=[sk_out, sk_txt], api_name="sketch")
 
-    with gr.Tab("Imagine"):
-        pr = gr.Textbox(label="Prompt", placeholder="a tea stall in Rangpur rain, cinematic")
-        im_out = gr.Image(type="pil", label="Image")
-        im_txt = gr.Textbox(label="Status")
-        im_btn = gr.Button("Generate image")
-        im_btn.click(imagine, inputs=pr, outputs=[im_out, im_txt], api_name="imagine")
-
-    with gr.Tab("Video"):
-        vpr = gr.Textbox(label="Prompt", placeholder="drone shot over a river at sunset")
-        v_out = gr.Video(label="Video")
-        v_txt = gr.Textbox(label="Status")
-        v_btn = gr.Button("Generate video")
-        v_btn.click(make_video, inputs=vpr, outputs=[v_out, v_txt], api_name="video")
-
-    with gr.Tab("Photo to video"):
-        iv_pr = gr.Textbox(label="Motion prompt", placeholder="slow zoom in, cinematic")
-        iv_out = gr.Video(label="Video")
-        iv_txt = gr.Textbox(label="Status")
-        iv_btn = gr.Button("Animate photo")
-        iv_btn.click(image_to_video, inputs=[image, iv_pr], outputs=[iv_out, iv_txt], api_name="i2v")
+    with gr.Tab("Lyrics"):
+        ly_in = gr.Textbox(label="Song", placeholder="Shape of You")
+        ly_out = gr.Textbox(label="Lyrics", lines=16)
+        ly_btn = gr.Button("Find lyrics")
+        ly_btn.click(lyrics, inputs=ly_in, outputs=ly_out, api_name="lyrics")
 
 
 demo.queue()
