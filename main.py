@@ -7,6 +7,7 @@ FLUX.1-schnell, photo tools, and lyrics all run through YOUR Space.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -224,6 +225,75 @@ def call_lyrics(query: str) -> str:
     return text
 
 
+def call_gitzip(repo: str) -> tuple[str, str]:
+    result = _predict(repo, api_name="/gitzip")
+    path = _as_path(result)
+    text = _as_text(result)
+    if not path:
+        raise RuntimeError(text or "GitHub ZIP came back empty")
+    return path, text
+
+
+def _refer_load() -> dict:
+    if not _REFER_FILE.exists():
+        return {}
+    try:
+        return json.loads(_REFER_FILE.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _refer_save(data: dict) -> None:
+    _REFER_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _refer_user(uid: int) -> dict:
+    data = _refer_load()
+    key = str(uid)
+    entry = data.get(key) or {"points": 0, "refs": [], "via": None}
+    data[key] = entry
+    _refer_save(data)
+    return entry
+
+
+def _refer_apply(new_uid: int, via_uid: int) -> str:
+    if new_uid == via_uid:
+        return "নিজেকে রেফার করা যায় না।"
+    data = _refer_load()
+    newbie = data.get(str(new_uid)) or {"points": 0, "refs": [], "via": None}
+    if newbie.get("via"):
+        return "আপনি আগেই রেফার হয়েছেন।"
+    host = data.get(str(via_uid)) or {"points": 0, "refs": [], "via": None}
+    refs = list(host.get("refs") or [])
+    if str(new_uid) in refs:
+        return "এই ইউজার আগেই কাউন্ট হয়েছে।"
+    newbie["via"] = via_uid
+    refs.append(str(new_uid))
+    host["refs"] = refs
+    host["points"] = int(host.get("points") or 0) + _POINTS_PER_REF
+    data[str(new_uid)] = newbie
+    data[str(via_uid)] = host
+    _refer_save(data)
+    return f"রেফার OK। ইউজার {via_uid} পেলেন {_POINTS_PER_REF} পয়েন্ট।"
+
+
+def _refer_text(uid: int) -> str:
+    entry = _refer_user(uid)
+    uname = _BOT_USERNAME or "your_bot"
+    link = f"https://t.me/{uname}?start=ref_{uid}"
+    n = len(entry.get("refs") or [])
+    pts = int(entry.get("points") or 0)
+    return (
+        f"<b>রেফার / আর্নিং</b>\n"
+        f"পয়েন্ট: <b>{pts}</b>\n"
+        f"রেফার সংখ্যা: <b>{n}</b> (প্রতি রেফারে {_POINTS_PER_REF} পয়েন্ট)\n\n"
+        f"আপনার লিংক:\n<code>{link}</code>\n\n"
+        f"এই লিংকে কেউ /start দিলে আপনি পয়েন্ট পাবেন।\n"
+        f"<i>এটা ইন-বট পয়েন্ট — আসল টাকা/পেআউট না। "
+        f"Render রিডিপ্লয় হলে হিসাব রিসেট হতে পারে।</i>"
+    )
+
+
 async def _reply_long(message, text: str) -> None:
     text = (text or "").strip() or "(empty)"
     for start in range(0, len(text), 3900):
@@ -312,7 +382,26 @@ async def _set_mode(message, context: ContextTypes.DEFAULT_TYPE, mode: str) -> N
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    uid = update.effective_user.id if update.effective_user else 0
+    if args and str(args[0]).startswith("ref_") and uid:
+        try:
+            via = int(str(args[0])[4:])
+            note = _refer_apply(uid, via)
+            await update.message.reply_text(note, reply_markup=MENU_KEYBOARD)
+        except ValueError:
+            pass
     await _send_menu(update.message)
+
+
+async def refer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id if update.effective_user else 0
+    await update.message.reply_text(
+        _refer_text(uid),
+        parse_mode="HTML",
+        reply_markup=MENU_KEYBOARD,
+        disable_web_page_preview=True,
+    )
 
 
 async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -321,6 +410,9 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     rest = raw.split(None, 1)[1].strip() if len(raw.split(None, 1)) > 1 else ""
     if cmd in {"menu", "help"}:
         await _send_menu(update.message)
+        return
+    if cmd in {"refer", "earn"}:
+        await refer_command(update, context)
         return
     if cmd not in _ALL_MODES:
         await _send_menu(update.message)
@@ -338,6 +430,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     data = query.data or ""
     if data.startswith("mode:"):
         mode = data.split(":", 1)[1]
+        if mode == "refer":
+            uid = update.effective_user.id if update.effective_user else 0
+            await query.message.reply_text(
+                _refer_text(uid),
+                parse_mode="HTML",
+                reply_markup=MENU_KEYBOARD,
+                disable_web_page_preview=True,
+            )
+            return
         if mode in _ALL_MODES:
             context.user_data["mode"] = mode
             await query.message.reply_text(
@@ -358,6 +459,11 @@ async def _run_prompt(message, mode: str, prompt: str) -> None:
             text = await asyncio.to_thread(call_lyrics, prompt)
             await _reply_long(message, text)
             return
+        if mode == "git":
+            await message.chat.send_action(action="upload_document")
+            path, note = await asyncio.to_thread(call_gitzip, prompt)
+            await _send_image(message, path, caption=note or "repo.zip", as_document=True)
+            return
         await message.chat.send_action(action="upload_photo")
         path, note = await asyncio.to_thread(call_imagine, prompt)
         await _send_image(message, path, caption=note or "FLUX")
@@ -375,7 +481,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _send_menu(update.message)
         return
     if text in _BTN_MODE:
-        await _set_mode(update.message, context, _BTN_MODE[text])
+        mode = _BTN_MODE[text]
+        if mode == "refer":
+            await refer_command(update, context)
+            return
+        await _set_mode(update.message, context, mode)
         return
     mode = (context.user_data or {}).get("mode") or "imagine"
     if mode not in _PROMPT_MODES:
@@ -431,7 +541,9 @@ telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 telegram_app.add_handler(CommandHandler("start", start_command))
 telegram_app.add_handler(CommandHandler("help", start_command))
 telegram_app.add_handler(CommandHandler("menu", start_command))
-for _cmd in ("caption", "ocr", "detect", "bg", "sketch", "imagine", "lyrics"):
+telegram_app.add_handler(CommandHandler("refer", refer_command))
+telegram_app.add_handler(CommandHandler("earn", refer_command))
+for _cmd in ("caption", "ocr", "detect", "bg", "sketch", "imagine", "lyrics", "git"):
     telegram_app.add_handler(CommandHandler(_cmd, mode_command))
 telegram_app.add_handler(CallbackQueryHandler(on_button))
 telegram_app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
@@ -444,18 +556,23 @@ app = FastAPI()
 async def on_startup() -> None:
     await telegram_app.initialize()
     await telegram_app.start()
+    global _BOT_USERNAME
     try:
+        me = await telegram_app.bot.get_me()
+        _BOT_USERNAME = me.username or ""
         await telegram_app.bot.set_my_commands(
             [
-                BotCommand("start", "Open the menu"),
-                BotCommand("imagine", "FLUX text → image"),
-                BotCommand("lyrics", "Song name → lyrics"),
-                BotCommand("caption", "Describe a photo"),
-                BotCommand("ocr", "Read text in a photo"),
-                BotCommand("detect", "Find objects"),
-                BotCommand("bg", "Remove background"),
-                BotCommand("sketch", "Pencil sketch"),
-                BotCommand("menu", "Show buttons"),
+                BotCommand("start", "মেনু"),
+                BotCommand("imagine", "FLUX লেখা → ছবি"),
+                BotCommand("lyrics", "গানের লিরিক্স"),
+                BotCommand("git", "GitHub রিপো ZIP"),
+                BotCommand("refer", "রেফার লিংক / পয়েন্ট"),
+                BotCommand("caption", "ছবি বর্ণনা"),
+                BotCommand("ocr", "ছবির লেখা"),
+                BotCommand("detect", "বস্তু খোঁজা"),
+                BotCommand("bg", "ব্যাকগ্রাউন্ড কাটা"),
+                BotCommand("sketch", "স্কেচ"),
+                BotCommand("menu", "বাটন"),
             ]
         )
     except Exception:  # noqa: BLE001

@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import random
+import re
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -199,6 +202,55 @@ def lyrics(query: str) -> str:
     return f"No lyrics found for “{text}”."
 
 
+_GIT_MAX = 40 * 1024 * 1024
+
+
+def _parse_repo(text: str) -> tuple[str, str]:
+    raw = (text or "").strip()
+    raw = raw.replace("https://github.com/", "").replace("http://github.com/", "")
+    raw = raw.replace("www.github.com/", "").removesuffix(".git").strip("/")
+    parts = [p for p in raw.split("/") if p]
+    if len(parts) < 2 or not re.match(r"^[\w.-]+$", parts[0]) or not re.match(r"^[\w.-]+$", parts[1]):
+        raise ValueError("Send owner/repo or a GitHub URL. Example: tajhatAti/Lyr")
+    return parts[0], parts[1]
+
+
+def git_zip(repo: str):
+    try:
+        owner, name = _parse_repo(repo)
+    except ValueError as exc:
+        return None, str(exc)
+    token = (os.environ.get("GITHUB_TOKEN") or "").strip()
+    headers = {"User-Agent": "ImageBot/1.0", "Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    last = "no branch"
+    for branch in ("main", "master"):
+        url = f"https://codeload.github.com/{owner}/{name}/zip/refs/heads/{branch}"
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = resp.read(_GIT_MAX + 1)
+        except urllib.error.HTTPError as exc:
+            last = f"{branch}: HTTP {exc.code}"
+            continue
+        except Exception as exc:  # noqa: BLE001
+            last = f"{branch}: {exc}"
+            continue
+        if len(data) > _GIT_MAX:
+            return None, f"{owner}/{name} is larger than ~40 MB (Telegram bot limit)."
+        if len(data) < 100:
+            last = f"{branch}: empty"
+            continue
+        fd, path = tempfile.mkstemp(suffix=f"-{name}.zip")
+        os.close(fd)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        mb = len(data) / (1024 * 1024)
+        return path, f"{owner}/{name} ({branch}, {mb:.1f} MB)"
+    return None, f"Could not download {owner}/{name}. {last}"
+
+
 with gr.Blocks(title="Image Bot Space") as demo:
     gr.Markdown(
         "# Image Bot Space\n"
@@ -247,6 +299,13 @@ with gr.Blocks(title="Image Bot Space") as demo:
         ly_out = gr.Textbox(label="Lyrics", lines=16)
         ly_btn = gr.Button("Find lyrics")
         ly_btn.click(lyrics, inputs=ly_in, outputs=ly_out, api_name="lyrics")
+
+    with gr.Tab("GitHub"):
+        gh_in = gr.Textbox(label="Repo", placeholder="tajhatAti/Lyr")
+        gh_file = gr.File(label="ZIP")
+        gh_txt = gr.Textbox(label="Status")
+        gh_btn = gr.Button("Download repo ZIP")
+        gh_btn.click(git_zip, inputs=gh_in, outputs=[gh_file, gh_txt], api_name="gitzip")
 
 
 demo.queue()

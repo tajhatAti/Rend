@@ -15,3 +15,4 @@ On this ZeroGPU Space:
 - `/imagine` — FLUX.1-schnell (text → image)
 - `/caption` `/ocr` `/detect` `/bg` `/sketch`
 - `/lyrics` — song name → lrclib.net
+- `/gitzip` — GitHub `owner/repo` → ZIP (max ~40 MB)
