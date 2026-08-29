@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import os
+import random
 import tempfile
 import urllib.error
 import urllib.parse
@@ -44,11 +45,18 @@ def _pollinations_key() -> str:
 
 
 def _http_get(url: str, timeout: int = 180) -> bytes:
+    key = _pollinations_key()
+    if key and "key=" not in url:
+        join = "&" if "?" in url else "?"
+        url = f"{url}{join}key={urllib.parse.quote(key)}"
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "ImageBot/1.0", "Accept": "*/*"},
+        headers={
+            "User-Agent": "Mozilla/5.0 ImageBot",
+            "Accept": "image/*,video/*,*/*",
+            "Referer": "https://pollinations.ai/",
+        },
     )
-    key = _pollinations_key()
     if key:
         req.add_header("Authorization", f"Bearer {key}")
     try:
@@ -58,7 +66,7 @@ def _http_get(url: str, timeout: int = 180) -> bytes:
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")[:400]
         raise RuntimeError(f"HTTP {exc.code}: {body or exc.reason}") from exc
-    if "application/json" in ctype or "text/html" in ctype or "text/plain" in ctype:
+    if data[:1] in (b"{", b"<") or "application/json" in ctype or "text/html" in ctype:
         text = data.decode("utf-8", "replace")[:400]
         raise RuntimeError(text or f"Unexpected {ctype}")
     if not data or len(data) < 32:
