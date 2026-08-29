@@ -251,12 +251,60 @@ def git_zip(repo: str):
     return None, f"Could not download {owner}/{name}. {last}"
 
 
+_CHAT_ID = "meta-llama/Llama-3.2-3B-Instruct"
+_chat_pipe = None
+
+
+def _load_chat():
+    global _chat_pipe
+    if _chat_pipe is not None:
+        return _chat_pipe
+    import torch
+    from transformers import pipeline
+
+    token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip() or None
+    kwargs = {
+        "task": "text-generation",
+        "model": _CHAT_ID,
+        "torch_dtype": torch.bfloat16,
+        "device_map": "cuda" if torch.cuda.is_available() else "cpu",
+    }
+    if token:
+        kwargs["token"] = token
+    _chat_pipe = pipeline(**kwargs)
+    return _chat_pipe
+
+
+@spaces.GPU(duration=30)
+def chat(prompt: str) -> str:
+    text = (prompt or "").strip()
+    if not text:
+        return "Type a message."
+    text = text[:4000]
+    pipe = _load_chat()
+    messages = [
+        {"role": "system", "content": "You are a fast, helpful assistant. Reply in the user's language. Keep answers short."},
+        {"role": "user", "content": text},
+    ]
+    out = pipe(
+        messages,
+        max_new_tokens=160,
+        do_sample=False,
+        return_full_text=False,
+    )
+    if isinstance(out, list) and out:
+        item = out[0]
+        if isinstance(item, dict):
+            return str(item.get("generated_text") or item).strip()
+        return str(item).strip()
+    return str(out).strip()
+
+
 with gr.Blocks(title="Image Bot Space") as demo:
     gr.Markdown(
         "# Image Bot Space\n"
-        "Telegram backend. **FLUX.1-schnell** on this ZeroGPU for `/imagine`. "
-        "Photo tools: `/caption` `/ocr` `/detect` `/bg` `/sketch`. "
-        "Lyrics: `/lyrics` via lrclib."
+        "Telegram backend. **Chat:** Llama-3.2-3B-Instruct on ZeroGPU (`/chat`). "
+        "**Imagine:** FLUX.1-schnell. Photo tools + lyrics + GitHub ZIP."
     )
     image = gr.Image(type="pil", label="Image")
 
@@ -306,6 +354,12 @@ with gr.Blocks(title="Image Bot Space") as demo:
         gh_txt = gr.Textbox(label="Status")
         gh_btn = gr.Button("Download repo ZIP")
         gh_btn.click(git_zip, inputs=gh_in, outputs=[gh_file, gh_txt], api_name="gitzip")
+
+    with gr.Tab("Chat"):
+        ch_in = gr.Textbox(label="Message", placeholder="কেমন আছো?")
+        ch_out = gr.Textbox(label="Llama 3.2", lines=8)
+        ch_btn = gr.Button("Chat")
+        ch_btn.click(chat, inputs=ch_in, outputs=ch_out, api_name="chat")
 
 
 demo.queue()

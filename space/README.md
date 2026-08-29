@@ -12,7 +12,10 @@ pinned: false
 Backend for the Telegram bot.
 
 On this ZeroGPU Space:
+- `/chat` — Llama-3.2-3B-Instruct (fast GPU chat)
 - `/imagine` — FLUX.1-schnell (text → image)
 - `/caption` `/ocr` `/detect` `/bg` `/sketch`
 - `/lyrics` — song name → lrclib.net
 - `/gitzip` — GitHub `owner/repo` → ZIP (max ~40 MB)
+
+Gated Llama needs Space secret `HF_TOKEN` (accept the model license on Hugging Face).

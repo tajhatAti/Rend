@@ -49,12 +49,18 @@ RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 _MAX_DOWNLOAD_BYTES = 19 * 1024 * 1024
 
 _PHOTO_MODES = {"caption", "ocr", "bg", "detect", "sketch"}
-_PROMPT_MODES = {"imagine", "lyrics"}
+_PROMPT_MODES = {"chat", "imagine", "lyrics", "git"}
 _ALL_MODES = _PHOTO_MODES | _PROMPT_MODES
+_REFER_FILE = Path(os.environ.get("REFER_FILE") or "refer.json")
+_BOT_USERNAME = ""
+_POINTS_PER_REF = 10
 
 _BTN_MODE = {
+    "💬 Chat": "chat",
     "✨ Imagine": "imagine",
     "🎵 Lyrics": "lyrics",
+    "📁 GitHub": "git",
+    "💸 Refer": "refer",
     "🖼 Describe": "caption",
     "🔤 OCR": "ocr",
     "📦 Detect": "detect",
@@ -64,10 +70,12 @@ _BTN_MODE = {
 
 MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("✨ Imagine"), KeyboardButton("🎵 Lyrics")],
-        [KeyboardButton("🖼 Describe"), KeyboardButton("🔤 OCR")],
-        [KeyboardButton("📦 Detect"), KeyboardButton("🪄 No BG")],
-        [KeyboardButton("✏️ Sketch"), KeyboardButton("📋 Menu")],
+        [KeyboardButton("💬 Chat"), KeyboardButton("✨ Imagine")],
+        [KeyboardButton("🎵 Lyrics"), KeyboardButton("📁 GitHub")],
+        [KeyboardButton("💸 Refer"), KeyboardButton("🖼 Describe")],
+        [KeyboardButton("🔤 OCR"), KeyboardButton("📦 Detect")],
+        [KeyboardButton("🪄 No BG"), KeyboardButton("✏️ Sketch")],
+        [KeyboardButton("📋 Menu")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -76,42 +84,50 @@ MENU_KEYBOARD = ReplyKeyboardMarkup(
 INLINE_MENU = InlineKeyboardMarkup(
     [
         [
+            InlineKeyboardButton("💬 Chat", callback_data="mode:chat"),
             InlineKeyboardButton("✨ Imagine", callback_data="mode:imagine"),
+        ],
+        [
             InlineKeyboardButton("🎵 Lyrics", callback_data="mode:lyrics"),
+            InlineKeyboardButton("📁 GitHub", callback_data="mode:git"),
         ],
         [
+            InlineKeyboardButton("💸 Refer", callback_data="mode:refer"),
             InlineKeyboardButton("🖼 Describe", callback_data="mode:caption"),
-            InlineKeyboardButton("🔤 OCR", callback_data="mode:ocr"),
         ],
         [
+            InlineKeyboardButton("🔤 OCR", callback_data="mode:ocr"),
             InlineKeyboardButton("📦 Detect", callback_data="mode:detect"),
-            InlineKeyboardButton("🪄 No BG", callback_data="mode:bg"),
         ],
-        [InlineKeyboardButton("✏️ Sketch", callback_data="mode:sketch")],
+        [
+            InlineKeyboardButton("🪄 No BG", callback_data="mode:bg"),
+            InlineKeyboardButton("✏️ Sketch", callback_data="mode:sketch"),
+        ],
     ]
 )
 
 START_HTML = (
     "<b>Image Bot</b>\n"
-    "Telegram → Render → your Space → you.\n\n"
-    "<b>Create</b>\n"
-    "✨ Imagine — FLUX.1-schnell on your ZeroGPU\n"
-    "🎵 Lyrics — song name (lrclib, via your Space)\n\n"
-    "<b>Photo tools</b>\n"
+    "Telegram → Render → আপনার Space → আপনি।\n\n"
+    "<b>এআই</b>\n"
+    "💬 Chat — Llama 3.2 3B (দ্রুত, ZeroGPU)\n"
+    "✨ Imagine — FLUX লেখা → ছবি\n\n"
+    "<b>অন্যান্য</b>\n"
+    "🎵 Lyrics · 📁 GitHub ZIP · 💸 Refer\n"
     "🖼 Describe · 🔤 OCR · 📦 Detect · 🪄 No BG · ✏️ Sketch\n\n"
-    "<i>Type a prompt for FLUX, a song name for lyrics,\n"
-    "or send a photo for the selected tool.\n"
-    "First FLUX run downloads the model — can take a few minutes.</i>"
+    "<i>ডিফল্ট: চ্যাট। প্রথম চ্যাটে মডেল ডাউনলোড হতে পারে।</i>"
 )
 
 MODE_HINT = {
-    "imagine": "Send a prompt.\nExample: a tea stall in Rangpur rain, cinematic",
-    "lyrics": "Send a song name.\nExample: Shape of You",
-    "caption": "Send a photo — I will describe it.",
-    "ocr": "Send a photo with text to read.",
-    "detect": "Send a photo — I will box objects.",
-    "bg": "Send a photo — I will cut the background.",
-    "sketch": "Send a photo — I will draw a pencil sketch.",
+    "chat": "কথা বলুন। Llama 3.2 3B উত্তর দেবে।\n/imagine দিলে ছবি মোডে যাবে।",
+    "imagine": "একটা প্রম্পট পাঠান।\nযেমন: a tea stall in Rangpur rain, cinematic",
+    "lyrics": "গানের নাম পাঠান।\nযেমন: Shape of You",
+    "git": "GitHub রিপো পাঠান।\nযেমন: tajhatAti/Lyr",
+    "caption": "একটা ছবি পাঠান — বর্ণনা করব।",
+    "ocr": "লেখার ছবি পাঠান — পড়ে দেব।",
+    "detect": "ছবি পাঠান — বস্তু বক্স করব।",
+    "bg": "ছবি পাঠান — ব্যাকগ্রাউন্ড কাটব।",
+    "sketch": "ছবি পাঠান — স্কেচ করব।",
 }
 
 if not TELEGRAM_BOT_TOKEN:
@@ -232,6 +248,13 @@ def call_gitzip(repo: str) -> tuple[str, str]:
     if not path:
         raise RuntimeError(text or "GitHub ZIP came back empty")
     return path, text
+
+
+def call_chat(prompt: str) -> str:
+    text = _as_text(_predict(prompt, api_name="/chat"))
+    if not text:
+        raise RuntimeError("Chat returned empty")
+    return text
 
 
 def _refer_load() -> dict:
@@ -419,7 +442,7 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     context.user_data["mode"] = cmd
     if rest and cmd in _PROMPT_MODES:
-        await _run_prompt(update.message, cmd, rest)
+        await _run_prompt(update.message, cmd, rest, context)
         return
     await _set_mode(update.message, context, cmd)
 
@@ -448,12 +471,34 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
 
-async def _run_prompt(message, mode: str, prompt: str) -> None:
-    await message.reply_text(
-        f"Working ({mode})… first FLUX run can take a few minutes.",
-        reply_markup=MENU_KEYBOARD,
-    )
+async def _run_prompt(
+    message,
+    mode: str,
+    prompt: str,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
+) -> None:
+    if mode != "chat":
+        await message.reply_text(f"Working ({mode})…", reply_markup=MENU_KEYBOARD)
     try:
+        if mode == "chat":
+            await message.chat.send_action(action="typing")
+            packed = prompt
+            hist: list = []
+            if context is not None:
+                hist = list((context.user_data or {}).get("chat_hist") or [])
+                bits = [
+                    f"{t.get('role')}: {str(t.get('content') or '')[:400]}"
+                    for t in hist[-6:]
+                ]
+                bits.append(f"user: {prompt}")
+                packed = "\n".join(bits)
+            text = await asyncio.to_thread(call_chat, packed)
+            if context is not None:
+                hist.append({"role": "user", "content": prompt[:400]})
+                hist.append({"role": "assistant", "content": text[:800]})
+                context.user_data["chat_hist"] = hist[-12:]
+            await _reply_long(message, text)
+            return
         if mode == "lyrics":
             await message.chat.send_action(action="typing")
             text = await asyncio.to_thread(call_lyrics, prompt)
@@ -487,11 +532,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         await _set_mode(update.message, context, mode)
         return
-    mode = (context.user_data or {}).get("mode") or "imagine"
+    mode = (context.user_data or {}).get("mode") or "chat"
     if mode not in _PROMPT_MODES:
-        mode = "imagine"
-        context.user_data["mode"] = "imagine"
-    await _run_prompt(update.message, mode, text)
+        mode = "chat"
+        context.user_data["mode"] = "chat"
+    await _run_prompt(update.message, mode, text, context)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -543,7 +588,7 @@ telegram_app.add_handler(CommandHandler("help", start_command))
 telegram_app.add_handler(CommandHandler("menu", start_command))
 telegram_app.add_handler(CommandHandler("refer", refer_command))
 telegram_app.add_handler(CommandHandler("earn", refer_command))
-for _cmd in ("caption", "ocr", "detect", "bg", "sketch", "imagine", "lyrics", "git"):
+for _cmd in ("caption", "ocr", "detect", "bg", "sketch", "imagine", "lyrics", "git", "chat"):
     telegram_app.add_handler(CommandHandler(_cmd, mode_command))
 telegram_app.add_handler(CallbackQueryHandler(on_button))
 telegram_app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
@@ -563,6 +608,7 @@ async def on_startup() -> None:
         await telegram_app.bot.set_my_commands(
             [
                 BotCommand("start", "মেনু"),
+                BotCommand("chat", "Llama 3.2 চ্যাট"),
                 BotCommand("imagine", "FLUX লেখা → ছবি"),
                 BotCommand("lyrics", "গানের লিরিক্স"),
                 BotCommand("git", "GitHub রিপো ZIP"),
