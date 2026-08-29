@@ -194,23 +194,32 @@ def imagine(prompt: str):
         return None, "Type a prompt."
     text = text[:800]
     q = urllib.parse.quote(text)
+    seed = random.randint(1, 2_000_000_000)
+    # image.pollinations.ai currently only serves Sana and 400s on flux/safe/nologo.
+    urls = [
+        f"https://image.pollinations.ai/prompt/{q}",
+        f"https://image.pollinations.ai/prompt/{q}?model=sana&seed={seed}",
+        f"https://gen.pollinations.ai/image/{q}?model=dreamshaper&width=1024&height=1024&seed={seed}",
+        f"https://gen.pollinations.ai/image/{q}?model=zimage&width=1024&height=1024&seed={seed}",
+        f"https://gen.pollinations.ai/image/{q}?model=flux&width=1024&height=1024&seed={seed}",
+    ]
     last = "no attempt"
-    for model in ("flux", "sana", "dreamshaper", "zimage"):
-        url = (
-            f"https://image.pollinations.ai/prompt/{q}"
-            f"?width=1024&height=1024&nologo=true&model={model}&safe=true"
-        )
+    for url in urls:
+        host = url.split("/")[2]
         try:
             data = _http_get(url, timeout=120)
             if not _is_image(data):
-                last = f"{model}: not an image"
+                last = f"{host}: not an image"
                 continue
             img = Image.open(io.BytesIO(data))
             img.load()
-            return img.convert("RGB"), f"Pollinations {model}"
+            return img.convert("RGB"), f"image via {host}"
         except Exception as exc:  # noqa: BLE001
-            last = f"{model}: {exc}"
-    return None, f"Text-to-image failed. {last}"
+            last = f"{host}: {exc}"
+    hint = ""
+    if not _pollinations_key():
+        hint = " Add Space secret POLLINATIONS_KEY from enter.pollinations.ai if this keeps failing."
+    return None, f"Text-to-image failed. {last}.{hint}"
 
 
 def _write_mp4(data: bytes) -> str:
