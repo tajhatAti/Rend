@@ -11,6 +11,8 @@ pinned: false
 
 Backend for the Telegram image bot.
 
-APIs: `/caption` `/ocr` `/detect` `/bg`
+On this Space (ZeroGPU): `/caption` `/ocr` `/detect` `/bg` `/sketch`
 
-This replaces the old lyrics app on this Space.
+Online APIs via Pollinations: `/imagine` `/video` `/i2v`
+
+Optional Space secret: `POLLINATIONS_KEY` (free key from https://enter.pollinations.ai) — needed for video / image-to-video.

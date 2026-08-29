@@ -1,14 +1,8 @@
 """
-Telegram image bot → YOUR Hugging Face Space (not random public Spaces).
+Telegram → Render → your Hugging Face Space → Render → Telegram.
 
-Flow:
-    Telegram
-      -> Render (this webhook)
-      -> your Space  /caption /ocr /detect /bg
-      -> Render
-      -> Telegram
-
-Deploy the files in ./space to a Gradio Space, then set HF_SPACE_ID.
+Photo tools run on the Space GPU. Imagine / video / i2v are online APIs
+the Space calls (Pollinations) — they are not loaded on the free GPU.
 """
 
 from __future__ import annotations
@@ -21,8 +15,22 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, Request
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -39,7 +47,78 @@ HF_SPACE_ID = (
 HF_API_TOKEN = (os.environ.get("HF_API_TOKEN") or "").strip() or None
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 _MAX_DOWNLOAD_BYTES = 19 * 1024 * 1024
-_PHOTO_MODES = {"caption", "ocr", "bg", "detect"}
+
+_PHOTO_MODES = {"caption", "ocr", "bg", "detect", "sketch", "i2v"}
+_PROMPT_MODES = {"imagine", "video"}
+_ALL_MODES = _PHOTO_MODES | _PROMPT_MODES
+
+_BTN_MODE = {
+    "✨ Imagine": "imagine",
+    "🎬 Video": "video",
+    "🖼 Describe": "caption",
+    "🔤 OCR": "ocr",
+    "📦 Detect": "detect",
+    "🪄 No BG": "bg",
+    "✏️ Sketch": "sketch",
+    "🎞 Photo→Video": "i2v",
+}
+
+MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("✨ Imagine"), KeyboardButton("🎬 Video")],
+        [KeyboardButton("🖼 Describe"), KeyboardButton("🔤 OCR")],
+        [KeyboardButton("📦 Detect"), KeyboardButton("🪄 No BG")],
+        [KeyboardButton("✏️ Sketch"), KeyboardButton("🎞 Photo→Video")],
+        [KeyboardButton("📋 Menu")],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+INLINE_MENU = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("✨ Imagine", callback_data="mode:imagine"),
+            InlineKeyboardButton("🎬 Video", callback_data="mode:video"),
+        ],
+        [
+            InlineKeyboardButton("🖼 Describe", callback_data="mode:caption"),
+            InlineKeyboardButton("🔤 OCR", callback_data="mode:ocr"),
+        ],
+        [
+            InlineKeyboardButton("📦 Detect", callback_data="mode:detect"),
+            InlineKeyboardButton("🪄 No BG", callback_data="mode:bg"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Sketch", callback_data="mode:sketch"),
+            InlineKeyboardButton("🎞 Photo→Video", callback_data="mode:i2v"),
+        ],
+    ]
+)
+
+START_HTML = (
+    "<b>Image Bot</b>\n"
+    "Telegram → Render → your Space → you.\n\n"
+    "<b>Create (online APIs)</b>\n"
+    "✨ Imagine — text → image\n"
+    "🎬 Video — prompt → short clip\n"
+    "🎞 Photo→Video — still → clip\n\n"
+    "<b>On your Space (ZeroGPU)</b>\n"
+    "🖼 Describe · 🔤 OCR · 📦 Detect · 🪄 No BG · ✏️ Sketch\n\n"
+    "<i>Type a prompt to generate an image.\n"
+    "Send a photo to run the selected tool.</i>"
+)
+
+MODE_HINT = {
+    "imagine": "Send a prompt.\nExample: a tea stall in Rangpur rain, cinematic",
+    "video": "Send a prompt.\nExample: drone shot over a river at golden hour",
+    "i2v": "Send a photo. Caption = motion (or I will use a slow camera move).",
+    "caption": "Send a photo — I will describe it.",
+    "ocr": "Send a photo with text to read.",
+    "detect": "Send a photo — I will box objects.",
+    "bg": "Send a photo — I will cut the background.",
+    "sketch": "Send a photo — I will draw a pencil sketch.",
+}
 
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("Missing TELEGRAM_BOT_TOKEN environment variable.")
@@ -53,7 +132,15 @@ def _client():
         from gradio_client import Client
 
         logger.info("Connecting to your Space %s …", HF_SPACE_ID)
-        _space = Client(HF_SPACE_ID, hf_token=HF_API_TOKEN, verbose=False)
+        try:
+            _space = Client(
+                HF_SPACE_ID,
+                hf_token=HF_API_TOKEN,
+                verbose=False,
+                httpx_kwargs={"timeout": 180.0},
+            )
+        except TypeError:
+            _space = Client(HF_SPACE_ID, hf_token=HF_API_TOKEN, verbose=False)
     return _space
 
 
@@ -85,22 +172,26 @@ def _as_text(value: Any) -> str:
     return str(value).strip()
 
 
+def _predict(*args, api_name: str):
+    return _client().predict(*args, api_name=api_name)
+
+
 def call_caption(image_path: str) -> str:
     from gradio_client import handle_file
 
-    return _as_text(_client().predict(handle_file(image_path), api_name="/caption"))
+    return _as_text(_predict(handle_file(image_path), api_name="/caption"))
 
 
 def call_ocr(image_path: str) -> str:
     from gradio_client import handle_file
 
-    return _as_text(_client().predict(handle_file(image_path), api_name="/ocr"))
+    return _as_text(_predict(handle_file(image_path), api_name="/ocr"))
 
 
 def call_detect(image_path: str) -> tuple[str, Optional[str]]:
     from gradio_client import handle_file
 
-    result = _client().predict(handle_file(image_path), api_name="/detect")
+    result = _predict(handle_file(image_path), api_name="/detect")
     if isinstance(result, (list, tuple)) and len(result) >= 2:
         return _as_text(result[1]), _as_path(result[0])
     return _as_text(result), _as_path(result)
@@ -109,28 +200,54 @@ def call_detect(image_path: str) -> tuple[str, Optional[str]]:
 def call_bg(image_path: str) -> str:
     from gradio_client import handle_file
 
-    path = _as_path(_client().predict(handle_file(image_path), api_name="/bg"))
+    path = _as_path(_predict(handle_file(image_path), api_name="/bg"))
     if not path:
         raise RuntimeError("Space /bg returned no image")
     return path
 
 
-HELP = (
-    "Image bot → your Hugging Face Space.\n\n"
-    "Send a photo:\n"
-    "  (no caption)  describe\n"
-    "  ocr           read text\n"
-    "  detect        objects\n"
-    "  bg            remove background\n\n"
-    "Commands: /caption /ocr /detect /bg\n\n"
-    f"Space: {HF_SPACE_ID}"
-)
+def call_sketch(image_path: str) -> str:
+    from gradio_client import handle_file
+
+    path = _as_path(_predict(handle_file(image_path), api_name="/sketch"))
+    if not path:
+        raise RuntimeError("Space /sketch returned no image")
+    return path
+
+
+def call_imagine(prompt: str) -> tuple[str, str]:
+    result = _predict(prompt, api_name="/imagine")
+    path = _as_path(result)
+    text = _as_text(result)
+    if not path:
+        raise RuntimeError(text or "Imagine returned no image")
+    return path, text
+
+
+def call_video(prompt: str) -> tuple[str, str]:
+    result = _predict(prompt, api_name="/video")
+    path = _as_path(result)
+    text = _as_text(result)
+    if not path:
+        raise RuntimeError(text or "Video returned no file")
+    return path, text
+
+
+def call_i2v(image_path: str, prompt: str) -> tuple[str, str]:
+    from gradio_client import handle_file
+
+    result = _predict(handle_file(image_path), prompt or "", api_name="/i2v")
+    path = _as_path(result)
+    text = _as_text(result)
+    if not path:
+        raise RuntimeError(text or "Image-to-video returned no file")
+    return path, text
 
 
 async def _reply_long(message, text: str) -> None:
     text = (text or "").strip() or "(empty)"
     for start in range(0, len(text), 3900):
-        await message.reply_text(text[start : start + 3900])
+        await message.reply_text(text[start : start + 3900], reply_markup=MENU_KEYBOARD)
 
 
 async def _send_image(message, path: str, caption: str = "", as_document: bool = False) -> None:
@@ -138,14 +255,37 @@ async def _send_image(message, path: str, caption: str = "", as_document: bool =
     if p.exists():
         with p.open("rb") as handle:
             if as_document:
-                await message.reply_document(document=handle, filename=p.name, caption=caption or None)
+                await message.reply_document(
+                    document=handle,
+                    filename=p.name,
+                    caption=caption or None,
+                    reply_markup=MENU_KEYBOARD,
+                )
             else:
-                await message.reply_photo(photo=handle, caption=caption or None)
+                await message.reply_photo(
+                    photo=handle,
+                    caption=caption or None,
+                    reply_markup=MENU_KEYBOARD,
+                )
         return
     if path.startswith("http"):
-        await message.reply_photo(photo=path, caption=caption or None)
+        await message.reply_photo(photo=path, caption=caption or None, reply_markup=MENU_KEYBOARD)
         return
-    await message.reply_text(caption or "No image file came back.")
+    await message.reply_text(caption or "No image file came back.", reply_markup=MENU_KEYBOARD)
+
+
+async def _send_video(message, path: str, caption: str = "") -> None:
+    p = Path(path)
+    if p.exists():
+        with p.open("rb") as handle:
+            await message.reply_video(
+                video=handle,
+                caption=caption[:900] or None,
+                supports_streaming=True,
+                reply_markup=MENU_KEYBOARD,
+            )
+        return
+    await message.reply_text(caption or "No video file came back.", reply_markup=MENU_KEYBOARD)
 
 
 async def _download_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -180,58 +320,162 @@ def _photo_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
         return "bg"
     if caption in {"detect", "objects", "/detect"} or caption.startswith("detect"):
         return "detect"
+    if caption in {"sketch", "pencil", "/sketch"} or caption.startswith("sketch"):
+        return "sketch"
+    if caption in {"video", "i2v", "animate", "/video", "/i2v"} or caption.startswith("video"):
+        return "i2v"
     if caption in {"caption", "describe", "/caption"}:
         return "caption"
-    return saved
+    return saved if saved in _PHOTO_MODES else "caption"
+
+
+def _i2v_prompt(update: Update) -> str:
+    caption = (update.message.caption or "").strip()
+    low = caption.lower()
+    for prefix in ("video", "i2v", "animate", "/video", "/i2v"):
+        if low == prefix:
+            return ""
+        if low.startswith(prefix + " "):
+            return caption.split(None, 1)[1].strip()
+    if low in {"ocr", "bg", "detect", "sketch", "caption", "describe"}:
+        return ""
+    return caption
+
+
+async def _send_menu(message) -> None:
+    await message.reply_text(
+        START_HTML,
+        parse_mode="HTML",
+        reply_markup=MENU_KEYBOARD,
+    )
+    await message.reply_text("Pick a tool:", reply_markup=INLINE_MENU)
+
+
+async def _set_mode(message, context: ContextTypes.DEFAULT_TYPE, mode: str) -> None:
+    context.user_data["mode"] = mode
+    await message.reply_text(
+        f"<b>{mode}</b>\n{MODE_HINT.get(mode, 'Send a photo or a prompt.')}",
+        parse_mode="HTML",
+        reply_markup=MENU_KEYBOARD,
+    )
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(HELP)
+    await _send_menu(update.message)
 
 
 async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cmd = update.message.text.split()[0].lstrip("/").split("@")[0]
-    if cmd not in _PHOTO_MODES:
-        await update.message.reply_text(HELP)
+    raw = update.message.text or ""
+    cmd = raw.split()[0].lstrip("/").split("@")[0]
+    rest = raw.split(None, 1)[1].strip() if len(raw.split(None, 1)) > 1 else ""
+    if cmd == "menu" or cmd == "help":
+        await _send_menu(update.message)
+        return
+    if cmd not in _ALL_MODES:
+        await _send_menu(update.message)
         return
     context.user_data["mode"] = cmd
-    await update.message.reply_text(f"Mode: {cmd}. Send a photo.")
+    if rest and cmd in _PROMPT_MODES:
+        await _run_prompt(update.message, cmd, rest)
+        return
+    await _set_mode(update.message, context, cmd)
+
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = (query.data or "")
+    if data.startswith("mode:"):
+        mode = data.split(":", 1)[1]
+        if mode in _ALL_MODES:
+            context.user_data["mode"] = mode
+            await query.message.reply_text(
+                f"<b>{mode}</b>\n{MODE_HINT.get(mode, '')}",
+                parse_mode="HTML",
+                reply_markup=MENU_KEYBOARD,
+            )
+
+
+async def _run_prompt(message, mode: str, prompt: str) -> None:
+    await message.reply_text(
+        f"Working ({mode})… this can take up to a couple of minutes.",
+        reply_markup=MENU_KEYBOARD,
+    )
+    try:
+        if mode == "video":
+            await message.chat.send_action(action="upload_video")
+            path, note = await asyncio.to_thread(call_video, prompt)
+            await _send_video(message, path, caption=note or "video")
+            return
+        await message.chat.send_action(action="upload_photo")
+        path, note = await asyncio.to_thread(call_imagine, prompt)
+        await _send_image(message, path, caption=note or "imagine")
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Prompt call failed (%s)", mode)
+        await message.reply_text(
+            f"Could not generate ({mode}).\n({exc.__class__.__name__}: {exc})",
+            reply_markup=MENU_KEYBOARD,
+        )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Send a photo. Text-to-image (FLUX) needs a GPU on your Space — "
-        "this Space runs caption / ocr / detect / bg on CPU.\n\n" + HELP
-    )
+    text = (update.message.text or "").strip()
+    if text == "📋 Menu":
+        await _send_menu(update.message)
+        return
+    if text in _BTN_MODE:
+        await _set_mode(update.message, context, _BTN_MODE[text])
+        return
+    mode = (context.user_data or {}).get("mode") or "imagine"
+    if mode not in _PROMPT_MODES:
+        mode = "imagine"
+        context.user_data["mode"] = "imagine"
+    await _run_prompt(update.message, mode, text)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     mode = _photo_mode(update, context)
-    await update.message.reply_text(f"Sending to your Space ({mode})… first run can take a minute.")
-    await update.message.chat.send_action(action="upload_photo")
+    await update.message.reply_text(
+        f"Sending to your Space ({mode})… first run can take a minute.",
+        reply_markup=MENU_KEYBOARD,
+    )
     tmp_path = None
     try:
         tmp_path = await _download_photo(update, context)
         if mode == "bg":
+            await update.message.chat.send_action(action="upload_document")
             out = await asyncio.to_thread(call_bg, tmp_path)
             await _send_image(update.message, out, caption="background removed", as_document=True)
             return
+        if mode == "sketch":
+            await update.message.chat.send_action(action="upload_photo")
+            out = await asyncio.to_thread(call_sketch, tmp_path)
+            await _send_image(update.message, out, caption="sketch")
+            return
+        if mode == "i2v":
+            await update.message.chat.send_action(action="upload_video")
+            prompt = _i2v_prompt(update)
+            path, note = await asyncio.to_thread(call_i2v, tmp_path, prompt)
+            await _send_video(update.message, path, caption=note or "photo→video")
+            return
         if mode == "detect":
+            await update.message.chat.send_action(action="upload_photo")
             text, image = await asyncio.to_thread(call_detect, tmp_path)
             if image:
                 await _send_image(update.message, image, caption=(text or "detect")[:900])
             if text:
                 await _reply_long(update.message, text)
             return
+        await update.message.chat.send_action(action="typing")
         fn = call_ocr if mode == "ocr" else call_caption
         text = await asyncio.to_thread(fn, tmp_path)
         await _reply_long(update.message, text)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Space call failed (%s)", mode)
         await update.message.reply_text(
-            "Could not reach your Space. Build the Space from the repo `space/` "
-            "folder, wait until it is Running, then check HF_SPACE_ID on Render.\n"
-            f"({exc.__class__.__name__}: {exc})"
+            "Could not finish that request.\n"
+            f"({exc.__class__.__name__}: {exc})",
+            reply_markup=MENU_KEYBOARD,
         )
     finally:
         if tmp_path:
@@ -241,8 +485,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 telegram_app.add_handler(CommandHandler("start", start_command))
 telegram_app.add_handler(CommandHandler("help", start_command))
-for _cmd in ("caption", "ocr", "detect", "bg"):
+telegram_app.add_handler(CommandHandler("menu", start_command))
+for _cmd in ("caption", "ocr", "detect", "bg", "sketch", "imagine", "video", "i2v"):
     telegram_app.add_handler(CommandHandler(_cmd, mode_command))
+telegram_app.add_handler(CallbackQueryHandler(on_button))
 telegram_app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
@@ -253,6 +499,23 @@ app = FastAPI()
 async def on_startup() -> None:
     await telegram_app.initialize()
     await telegram_app.start()
+    try:
+        await telegram_app.bot.set_my_commands(
+            [
+                BotCommand("start", "Open the menu"),
+                BotCommand("imagine", "Text → image"),
+                BotCommand("video", "Prompt → video"),
+                BotCommand("i2v", "Photo → video"),
+                BotCommand("caption", "Describe a photo"),
+                BotCommand("ocr", "Read text in a photo"),
+                BotCommand("detect", "Find objects"),
+                BotCommand("bg", "Remove background"),
+                BotCommand("sketch", "Pencil sketch"),
+                BotCommand("menu", "Show buttons"),
+            ]
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not set bot commands")
     logger.info("Image bot started. space=%s", HF_SPACE_ID)
     if RENDER_EXTERNAL_URL:
         logger.info(
@@ -270,7 +533,20 @@ async def on_shutdown() -> None:
 
 @app.get("/")
 async def health_check():
-    return {"status": "ok", "space": HF_SPACE_ID, "apis": ["/caption", "/ocr", "/detect", "/bg"]}
+    return {
+        "status": "ok",
+        "space": HF_SPACE_ID,
+        "apis": [
+            "/caption",
+            "/ocr",
+            "/detect",
+            "/bg",
+            "/sketch",
+            "/imagine",
+            "/video",
+            "/i2v",
+        ],
+    }
 
 
 @app.post("/webhook/{token}")
