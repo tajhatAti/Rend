@@ -630,6 +630,7 @@ async def on_startup() -> None:
             RENDER_EXTERNAL_URL,
             TELEGRAM_BOT_TOKEN,
         )
+    asyncio.create_task(_keep_space_awake())
 
 
 @app.on_event("shutdown")

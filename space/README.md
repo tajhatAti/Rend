@@ -19,3 +19,6 @@ On this ZeroGPU Space:
 - `/gitzip` — GitHub `owner/repo` → ZIP (max ~40 MB)
 
 Gated Llama needs Space secret `HF_TOKEN` (accept the model license on Hugging Face).
+
+Keep Render awake: Space **Variable** (not Secret) `RENDER_PING_URL` = `https://YOUR-APP.onrender.com/`
+The Space GETs that URL every 5 minutes. If the Space itself sleeps, pings stop.

@@ -362,6 +362,41 @@ with gr.Blocks(title="Image Bot Space") as demo:
         ch_btn.click(chat, inputs=ch_in, outputs=ch_out, api_name="chat")
 
 
+def _render_ping_url() -> str:
+    raw = (
+        os.environ.get("RENDER_PING_URL")
+        or os.environ.get("RENDER_URL")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        or ""
+    ).strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = "https://" + raw
+    parsed = urllib.parse.urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not host.endswith(".onrender.com"):
+        return ""
+    return f"https://{host}/"
+
+
+def _keep_render_awake() -> None:
+    url = _render_ping_url()
+    if not url:
+        return
+    while True:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "HF-Space-RenderPing/1.0", "Accept": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=20).read(256)
+        except Exception:
+            pass
+        time.sleep(300)
+
+
 demo.queue()
+threading.Thread(target=_keep_render_awake, daemon=True, name="render-ping").start()
 if __name__ == "__main__":
     demo.launch()
