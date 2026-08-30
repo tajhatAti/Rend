@@ -10,11 +10,14 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -53,12 +56,13 @@ RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 # Hugging Face Space URL this Render app pings so the Space does not sleep.
 # Format: https://<username>-<space-name>.hf.space
-# Override with HF_SPACE_PING_URL if the Space subdomain changes.
+# Override with HF_SPACE_PING_URL (comma-separated if more than one Space).
+# Extra targets (pinged at the same time): PING_URLS=https://a/,https://b/,https://c/
 HF_SPACE_PING_URL = (
     os.environ.get("HF_SPACE_PING_URL")
     or "https://madarauchihagmailcom-my.hf.space/"
 ).strip()
-# 10 hours between keep-alive GETs (user request).
+# Render → Hugging Face: every 10 hours.
 KEEP_ALIVE_INTERVAL_SECONDS = 10 * 60 * 60
 KEEP_ALIVE_TIMEOUT_SECONDS = 30
 _MAX_DOWNLOAD_BYTES = 19 * 1024 * 1024
@@ -597,38 +601,81 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             Path(tmp_path).unlink(missing_ok=True)
 
 
-def _keep_space_awake() -> None:
-    """Background loop: GET the Hugging Face Space every 10 hours.
+def _split_ping_urls(*chunks: str) -> list[str]:
+    """Parse comma / semicolon / whitespace separated https URLs, de-duplicated."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for chunk in chunks:
+        for raw in re.split(r"[\s,;]+", chunk or ""):
+            item = raw.strip().strip("'\"")
+            if not item:
+                continue
+            if "://" not in item:
+                item = "https://" + item
+            parsed = urlparse(item)
+            host = (parsed.hostname or "").lower()
+            if parsed.scheme != "https" or not host:
+                print(f"[keep-alive] skipped (need https URL): {item}", flush=True)
+                continue
+            url = f"https://{host}{parsed.path or '/'}"
+            if url not in seen:
+                seen.add(url)
+                out.append(url)
+    return out
 
-    Runs in a daemon thread so FastAPI / Telegram keep serving requests.
-    Timeouts and connection errors are logged; they never crash the app.
+
+def _keep_alive_targets() -> list[str]:
+    """Primary Space URL(s) plus optional extra PING_URLS, all hit together."""
+    extra = os.environ.get("PING_URLS") or os.environ.get("KEEP_ALIVE_URLS") or ""
+    urls = _split_ping_urls(HF_SPACE_PING_URL, extra)
+    return urls or _split_ping_urls("https://madarauchihagmailcom-my.hf.space/")
+
+
+def _ping_one(url: str) -> None:
+    """GET one URL. Never raises — timeout / connection errors are logged."""
+    try:
+        response = requests.get(
+            url,
+            timeout=KEEP_ALIVE_TIMEOUT_SECONDS,
+            headers={"User-Agent": "Rend-KeepAlive/1.0", "Accept": "text/html"},
+        )
+        msg = f"[keep-alive] success {url} status={response.status_code}"
+        print(msg, flush=True)
+        logger.info("Keep-alive ping ok: %s status=%s", url, response.status_code)
+    except requests.exceptions.Timeout:
+        msg = f"[keep-alive] timeout after {KEEP_ALIVE_TIMEOUT_SECONDS}s: {url}"
+        print(msg, flush=True)
+        logger.warning("Keep-alive ping timeout: %s", url)
+    except requests.exceptions.ConnectionError as exc:
+        msg = f"[keep-alive] connection error: {url} ({exc})"
+        print(msg, flush=True)
+        logger.warning("Keep-alive ping connection error: %s (%s)", url, exc)
+    except Exception as exc:  # noqa: BLE001 — never let this thread kill the bot
+        msg = f"[keep-alive] failed: {url} ({exc})"
+        print(msg, flush=True)
+        logger.warning("Keep-alive ping failed: %s (%s)", url, exc)
+
+
+def _keep_space_awake() -> None:
+    """Background loop: GET Hugging Face (and extra URLs) every 10 hours, in parallel.
+
+    Daemon thread so FastAPI / Telegram keep serving. Failures never crash the app.
     """
-    url = HF_SPACE_PING_URL
-    logger.info("Keep-alive thread started. ping=%s every %ss", url, KEEP_ALIVE_INTERVAL_SECONDS)
-    print(f"[keep-alive] started → {url} every {KEEP_ALIVE_INTERVAL_SECONDS}s", flush=True)
+    urls = _keep_alive_targets()
+    logger.info(
+        "Keep-alive thread started. ping=%s every %ss",
+        urls,
+        KEEP_ALIVE_INTERVAL_SECONDS,
+    )
+    print(
+        f"[keep-alive] started → {urls} every {KEEP_ALIVE_INTERVAL_SECONDS}s (parallel)",
+        flush=True,
+    )
+    workers = min(8, max(1, len(urls)))
     while True:
-        # Ping first, then sleep, so a fresh deploy wakes the Space immediately.
-        try:
-            response = requests.get(
-                url,
-                timeout=KEEP_ALIVE_TIMEOUT_SECONDS,
-                headers={"User-Agent": "Rend-KeepAlive/1.0", "Accept": "text/html"},
-            )
-            msg = f"[keep-alive] success {url} status={response.status_code}"
-            print(msg, flush=True)
-            logger.info("Keep-alive ping ok: %s status=%s", url, response.status_code)
-        except requests.exceptions.Timeout:
-            msg = f"[keep-alive] timeout after {KEEP_ALIVE_TIMEOUT_SECONDS}s: {url}"
-            print(msg, flush=True)
-            logger.warning("Keep-alive ping timeout: %s", url)
-        except requests.exceptions.ConnectionError as exc:
-            msg = f"[keep-alive] connection error: {url} ({exc})"
-            print(msg, flush=True)
-            logger.warning("Keep-alive ping connection error: %s (%s)", url, exc)
-        except Exception as exc:  # noqa: BLE001 — never let this thread kill the bot
-            msg = f"[keep-alive] failed: {url} ({exc})"
-            print(msg, flush=True)
-            logger.warning("Keep-alive ping failed: %s (%s)", url, exc)
+        # Ping all URLs at the same time, then sleep 10 hours.
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(_ping_one, urls))
         time.sleep(KEEP_ALIVE_INTERVAL_SECONDS)
 
 

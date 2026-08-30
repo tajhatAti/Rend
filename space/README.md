@@ -20,8 +20,11 @@ On this ZeroGPU Space:
 
 Gated Llama needs Space secret `HF_TOKEN` (accept the model license on Hugging Face).
 
-Mutual keep-alive (every 10 hours, `requests`, timeout 30s, daemon thread):
-- Render → Space: `https://madarauchihagmailcom-my.hf.space/`
-- Space → Render: `https://rend-y1aw.onrender.com/` (override with Space Variable `RENDER_PING_URL`)
+Mutual keep-alive (`requests`, timeout 30s, daemon thread, parallel GET):
+- Render → Hugging Face: every **10 hours** — default `https://madarauchihagmailcom-my.hf.space/`
+- Hugging Face → Render: every **2 minutes** — default `https://rend-y1aw.onrender.com/`
 
-If either side is already asleep, that side cannot ping. A Telegram message still wakes Render.
+More than 2 URLs at the same time — comma-separated env `PING_URLS` on either side, e.g.
+`PING_URLS=https://rend-y1aw.onrender.com/,https://other.onrender.com/,https://another-space.hf.space/`
+
+If the Space itself sleeps, its 2-minute pings stop. A Telegram message still wakes Render.

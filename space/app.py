@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
 import requests
@@ -368,56 +369,84 @@ with gr.Blocks(title="Image Bot Space") as demo:
 
 # Render URL this Space pings so the free-tier web service does not sleep.
 # Format: https://<app-name>.onrender.com/
-# Override with RENDER_PING_URL if the Render hostname changes.
+# Override with RENDER_PING_URL (comma-separated if more than one app).
+# Extra targets (pinged at the same time): PING_URLS=https://a.onrender.com/,https://b.onrender.com/
 RENDER_PING_URL_DEFAULT = "https://rend-y1aw.onrender.com/"
-KEEP_ALIVE_INTERVAL_SECONDS = 10 * 60 * 60  # 10 hours
+# Hugging Face → Render: every 2 minutes.
+KEEP_ALIVE_INTERVAL_SECONDS = 2 * 60
 KEEP_ALIVE_TIMEOUT_SECONDS = 30
 
 
-def _render_ping_url() -> str:
-    """Resolve the Render URL. Only https://*.onrender.com is allowed."""
-    raw = (
+def _split_ping_urls(*chunks: str) -> list[str]:
+    """Parse comma / semicolon / whitespace separated https URLs, de-duplicated."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for chunk in chunks:
+        for raw in re.split(r"[\s,;]+", chunk or ""):
+            item = raw.strip().strip("'\"")
+            if not item:
+                continue
+            if "://" not in item:
+                item = "https://" + item
+            parsed = urllib.parse.urlparse(item)
+            host = (parsed.hostname or "").lower()
+            if parsed.scheme != "https" or not host:
+                print(f"[keep-alive] skipped (need https URL): {item}", flush=True)
+                continue
+            url = f"https://{host}{parsed.path or '/'}"
+            if url not in seen:
+                seen.add(url)
+                out.append(url)
+    return out
+
+
+def _keep_alive_targets() -> list[str]:
+    """Primary Render URL(s) plus optional extra PING_URLS, all hit together."""
+    primary = (
         os.environ.get("RENDER_PING_URL")
         or os.environ.get("RENDER_URL")
         or os.environ.get("RENDER_EXTERNAL_URL")
         or RENDER_PING_URL_DEFAULT
-    ).strip()
-    if not raw:
-        return ""
-    if "://" not in raw:
-        raw = "https://" + raw
-    parsed = urllib.parse.urlparse(raw)
-    host = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or not host.endswith(".onrender.com"):
-        print(f"[keep-alive] skipped: not https://*.onrender.com ({raw})", flush=True)
-        return ""
-    return f"https://{host}/"
+    )
+    extra = os.environ.get("PING_URLS") or os.environ.get("KEEP_ALIVE_URLS") or ""
+    urls = _split_ping_urls(primary, extra)
+    return urls or _split_ping_urls(RENDER_PING_URL_DEFAULT)
+
+
+def _ping_one(url: str) -> None:
+    """GET one URL. Never raises — timeout / connection errors are logged."""
+    try:
+        response = requests.get(
+            url,
+            timeout=KEEP_ALIVE_TIMEOUT_SECONDS,
+            headers={"User-Agent": "HF-Space-KeepAlive/1.0", "Accept": "application/json"},
+        )
+        print(f"[keep-alive] success {url} status={response.status_code}", flush=True)
+    except requests.exceptions.Timeout:
+        print(f"[keep-alive] timeout after {KEEP_ALIVE_TIMEOUT_SECONDS}s: {url}", flush=True)
+    except requests.exceptions.ConnectionError as exc:
+        print(f"[keep-alive] connection error: {url} ({exc})", flush=True)
+    except Exception as exc:  # noqa: BLE001 — never let this thread kill Gradio
+        print(f"[keep-alive] failed: {url} ({exc})", flush=True)
 
 
 def _keep_render_awake() -> None:
-    """Background loop: GET Render every 10 hours.
+    """Background loop: GET Render (and extra URLs) every 2 minutes, in parallel.
 
-    Daemon thread — Gradio keeps serving. Failures are logged, never crash the Space.
+    Daemon thread — Gradio keeps serving. Failures never crash the Space.
     """
-    url = _render_ping_url()
-    if not url:
+    urls = _keep_alive_targets()
+    if not urls:
         return
-    print(f"[keep-alive] started → {url} every {KEEP_ALIVE_INTERVAL_SECONDS}s", flush=True)
+    print(
+        f"[keep-alive] started → {urls} every {KEEP_ALIVE_INTERVAL_SECONDS}s (parallel)",
+        flush=True,
+    )
+    workers = min(8, max(1, len(urls)))
     while True:
-        # Ping first, then sleep, so a Space restart wakes Render immediately.
-        try:
-            response = requests.get(
-                url,
-                timeout=KEEP_ALIVE_TIMEOUT_SECONDS,
-                headers={"User-Agent": "HF-Space-KeepAlive/1.0", "Accept": "application/json"},
-            )
-            print(f"[keep-alive] success {url} status={response.status_code}", flush=True)
-        except requests.exceptions.Timeout:
-            print(f"[keep-alive] timeout after {KEEP_ALIVE_TIMEOUT_SECONDS}s: {url}", flush=True)
-        except requests.exceptions.ConnectionError as exc:
-            print(f"[keep-alive] connection error: {url} ({exc})", flush=True)
-        except Exception as exc:  # noqa: BLE001 — never let this thread kill Gradio
-            print(f"[keep-alive] failed: {url} ({exc})", flush=True)
+        # Ping all URLs at the same time, then sleep 2 minutes.
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(_ping_one, urls))
         time.sleep(KEEP_ALIVE_INTERVAL_SECONDS)
 
 
