@@ -13,10 +13,14 @@ import os
 import random
 import re
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from functools import lru_cache
+
+import requests
 
 import gradio as gr
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
@@ -362,12 +366,21 @@ with gr.Blocks(title="Image Bot Space") as demo:
         ch_btn.click(chat, inputs=ch_in, outputs=ch_out, api_name="chat")
 
 
+# Render URL this Space pings so the free-tier web service does not sleep.
+# Format: https://<app-name>.onrender.com/
+# Override with RENDER_PING_URL if the Render hostname changes.
+RENDER_PING_URL_DEFAULT = "https://rend-y1aw.onrender.com/"
+KEEP_ALIVE_INTERVAL_SECONDS = 10 * 60 * 60  # 10 hours
+KEEP_ALIVE_TIMEOUT_SECONDS = 30
+
+
 def _render_ping_url() -> str:
+    """Resolve the Render URL. Only https://*.onrender.com is allowed."""
     raw = (
         os.environ.get("RENDER_PING_URL")
         or os.environ.get("RENDER_URL")
         or os.environ.get("RENDER_EXTERNAL_URL")
-        or ""
+        or RENDER_PING_URL_DEFAULT
     ).strip()
     if not raw:
         return ""
@@ -376,27 +389,40 @@ def _render_ping_url() -> str:
     parsed = urllib.parse.urlparse(raw)
     host = (parsed.hostname or "").lower()
     if parsed.scheme != "https" or not host.endswith(".onrender.com"):
+        print(f"[keep-alive] skipped: not https://*.onrender.com ({raw})", flush=True)
         return ""
     return f"https://{host}/"
 
 
 def _keep_render_awake() -> None:
+    """Background loop: GET Render every 10 hours.
+
+    Daemon thread — Gradio keeps serving. Failures are logged, never crash the Space.
+    """
     url = _render_ping_url()
     if not url:
         return
+    print(f"[keep-alive] started → {url} every {KEEP_ALIVE_INTERVAL_SECONDS}s", flush=True)
     while True:
+        # Ping first, then sleep, so a Space restart wakes Render immediately.
         try:
-            req = urllib.request.Request(
+            response = requests.get(
                 url,
-                headers={"User-Agent": "HF-Space-RenderPing/1.0", "Accept": "application/json"},
+                timeout=KEEP_ALIVE_TIMEOUT_SECONDS,
+                headers={"User-Agent": "HF-Space-KeepAlive/1.0", "Accept": "application/json"},
             )
-            urllib.request.urlopen(req, timeout=20).read(256)
-        except Exception:
-            pass
-        time.sleep(300)
+            print(f"[keep-alive] success {url} status={response.status_code}", flush=True)
+        except requests.exceptions.Timeout:
+            print(f"[keep-alive] timeout after {KEEP_ALIVE_TIMEOUT_SECONDS}s: {url}", flush=True)
+        except requests.exceptions.ConnectionError as exc:
+            print(f"[keep-alive] connection error: {url} ({exc})", flush=True)
+        except Exception as exc:  # noqa: BLE001 — never let this thread kill Gradio
+            print(f"[keep-alive] failed: {url} ({exc})", flush=True)
+        time.sleep(KEEP_ALIVE_INTERVAL_SECONDS)
 
 
 demo.queue()
+# Start keep-alive as soon as the Space process loads (daemon = dies with Gradio).
 threading.Thread(target=_keep_render_awake, daemon=True, name="render-ping").start()
 if __name__ == "__main__":
     demo.launch()

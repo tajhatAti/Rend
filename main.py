@@ -11,8 +11,12 @@ import json
 import logging
 import os
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
+
+import requests
 
 from fastapi import FastAPI, Request
 from telegram import (
@@ -46,6 +50,17 @@ HF_SPACE_ID = (
 ).strip()
 HF_API_TOKEN = (os.environ.get("HF_API_TOKEN") or "").strip() or None
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+
+# Hugging Face Space URL this Render app pings so the Space does not sleep.
+# Format: https://<username>-<space-name>.hf.space
+# Override with HF_SPACE_PING_URL if the Space subdomain changes.
+HF_SPACE_PING_URL = (
+    os.environ.get("HF_SPACE_PING_URL")
+    or "https://madarauchihagmailcom-my.hf.space/"
+).strip()
+# 10 hours between keep-alive GETs (user request).
+KEEP_ALIVE_INTERVAL_SECONDS = 10 * 60 * 60
+KEEP_ALIVE_TIMEOUT_SECONDS = 30
 _MAX_DOWNLOAD_BYTES = 19 * 1024 * 1024
 
 _PHOTO_MODES = {"caption", "ocr", "bg", "detect", "sketch"}
@@ -582,6 +597,51 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             Path(tmp_path).unlink(missing_ok=True)
 
 
+def _keep_space_awake() -> None:
+    """Background loop: GET the Hugging Face Space every 10 hours.
+
+    Runs in a daemon thread so FastAPI / Telegram keep serving requests.
+    Timeouts and connection errors are logged; they never crash the app.
+    """
+    url = HF_SPACE_PING_URL
+    logger.info("Keep-alive thread started. ping=%s every %ss", url, KEEP_ALIVE_INTERVAL_SECONDS)
+    print(f"[keep-alive] started → {url} every {KEEP_ALIVE_INTERVAL_SECONDS}s", flush=True)
+    while True:
+        # Ping first, then sleep, so a fresh deploy wakes the Space immediately.
+        try:
+            response = requests.get(
+                url,
+                timeout=KEEP_ALIVE_TIMEOUT_SECONDS,
+                headers={"User-Agent": "Rend-KeepAlive/1.0", "Accept": "text/html"},
+            )
+            msg = f"[keep-alive] success {url} status={response.status_code}"
+            print(msg, flush=True)
+            logger.info("Keep-alive ping ok: %s status=%s", url, response.status_code)
+        except requests.exceptions.Timeout:
+            msg = f"[keep-alive] timeout after {KEEP_ALIVE_TIMEOUT_SECONDS}s: {url}"
+            print(msg, flush=True)
+            logger.warning("Keep-alive ping timeout: %s", url)
+        except requests.exceptions.ConnectionError as exc:
+            msg = f"[keep-alive] connection error: {url} ({exc})"
+            print(msg, flush=True)
+            logger.warning("Keep-alive ping connection error: %s (%s)", url, exc)
+        except Exception as exc:  # noqa: BLE001 — never let this thread kill the bot
+            msg = f"[keep-alive] failed: {url} ({exc})"
+            print(msg, flush=True)
+            logger.warning("Keep-alive ping failed: %s (%s)", url, exc)
+        time.sleep(KEEP_ALIVE_INTERVAL_SECONDS)
+
+
+def _start_keep_alive_thread() -> None:
+    """Start the Space ping as a daemon thread (does not block shutdown)."""
+    thread = threading.Thread(
+        target=_keep_space_awake,
+        name="hf-space-keep-alive",
+        daemon=True,
+    )
+    thread.start()
+
+
 telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 telegram_app.add_handler(CommandHandler("start", start_command))
 telegram_app.add_handler(CommandHandler("help", start_command))
@@ -630,7 +690,8 @@ async def on_startup() -> None:
             RENDER_EXTERNAL_URL,
             TELEGRAM_BOT_TOKEN,
         )
-    asyncio.create_task(_keep_space_awake())
+    # FastAPI startup: wake the Space in the background (does not block requests).
+    _start_keep_alive_thread()
 
 
 @app.on_event("shutdown")
