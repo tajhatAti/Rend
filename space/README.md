@@ -18,7 +18,7 @@ On this ZeroGPU Space:
 - `/lyrics` — song name → lrclib.net
 - `/gitzip` — GitHub `owner/repo` → ZIP (max ~40 MB)
 
-Gated Llama needs Space secret `HF_TOKEN` (accept the model license on Hugging Face).
+Chat: Llama-3.2-3B-Instruct if Space secret `HF_TOKEN` + license are set; otherwise ungated `Qwen/Qwen2.5-1.5B-Instruct`. First chat can take a minute (model download).
 
 Mutual keep-alive (`requests`, timeout 30s, daemon thread, parallel GET):
 - Render → Hugging Face: every **10 hours** — default `https://madarauchihagmailcom-my.hf.space/`

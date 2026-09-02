@@ -256,53 +256,92 @@ def git_zip(repo: str):
     return None, f"Could not download {owner}/{name}. {last}"
 
 
-_CHAT_ID = "meta-llama/Llama-3.2-3B-Instruct"
+# Llama 3.2 3B is gated (needs Space secret HF_TOKEN + license). If that
+# fails, fall back to an ungated 1.5B so chat still answers.
+_CHAT_MODELS = [
+    (os.environ.get("CHAT_MODEL") or "meta-llama/Llama-3.2-3B-Instruct").strip(),
+    "Qwen/Qwen2.5-1.5B-Instruct",
+]
 _chat_pipe = None
+_chat_loaded_id = ""
 
 
 def _load_chat():
-    global _chat_pipe
+    global _chat_pipe, _chat_loaded_id
     if _chat_pipe is not None:
         return _chat_pipe
     import torch
     from transformers import pipeline
 
     token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip() or None
-    kwargs = {
-        "task": "text-generation",
-        "model": _CHAT_ID,
-        "torch_dtype": torch.bfloat16,
-        "device_map": "cuda" if torch.cuda.is_available() else "cpu",
-    }
-    if token:
-        kwargs["token"] = token
-    _chat_pipe = pipeline(**kwargs)
-    return _chat_pipe
+    last_err: Exception | None = None
+    for model_id in _CHAT_MODELS:
+        if not model_id:
+            continue
+        try:
+            kwargs = {
+                "task": "text-generation",
+                "model": model_id,
+                "torch_dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+                "device_map": "cuda" if torch.cuda.is_available() else "cpu",
+            }
+            if token:
+                kwargs["token"] = token
+            print(f"[chat] loading {model_id}", flush=True)
+            pipe = pipeline(**kwargs)
+            tok = getattr(pipe, "tokenizer", None)
+            if tok is not None and getattr(tok, "pad_token", None) is None:
+                tok.pad_token = tok.eos_token
+            _chat_pipe = pipe
+            _chat_loaded_id = model_id
+            print(f"[chat] ready {model_id}", flush=True)
+            return _chat_pipe
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            print(f"[chat] failed {model_id}: {exc}", flush=True)
+            _chat_pipe = None
+    raise RuntimeError(f"No chat model loaded: {last_err}")
 
 
-@spaces.GPU(duration=30)
+@spaces.GPU(duration=120)
 def chat(prompt: str) -> str:
     text = (prompt or "").strip()
     if not text:
         return "Type a message."
     text = text[:4000]
-    pipe = _load_chat()
-    messages = [
-        {"role": "system", "content": "You are a fast, helpful assistant. Reply in the user's language. Keep answers short."},
-        {"role": "user", "content": text},
-    ]
-    out = pipe(
-        messages,
-        max_new_tokens=160,
-        do_sample=False,
-        return_full_text=False,
-    )
-    if isinstance(out, list) and out:
-        item = out[0]
-        if isinstance(item, dict):
-            return str(item.get("generated_text") or item).strip()
-        return str(item).strip()
-    return str(out).strip()
+    try:
+        pipe = _load_chat()
+        tok = getattr(pipe, "tokenizer", None)
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a fast, helpful assistant. Reply in the user's language. Keep answers short.",
+            },
+            {"role": "user", "content": text},
+        ]
+        if tok is not None and getattr(tok, "chat_template", None):
+            packed = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        else:
+            packed = f"User: {text}\nAssistant:"
+        out = pipe(
+            packed,
+            max_new_tokens=160,
+            do_sample=False,
+            return_full_text=False,
+        )
+        if isinstance(out, list) and out:
+            item = out[0]
+            if isinstance(item, dict):
+                reply = str(item.get("generated_text") or item).strip()
+            else:
+                reply = str(item).strip()
+        else:
+            reply = str(out).strip()
+        tag = f"\n\n— {_chat_loaded_id}" if _chat_loaded_id else ""
+        return (reply + tag) if reply else "Chat returned empty."
+    except Exception as exc:  # noqa: BLE001 — never 500 the Space
+        print(f"[chat] error: {exc}", flush=True)
+        return f"Chat failed: {type(exc).__name__}: {exc}"
 
 
 with gr.Blocks(title="Image Bot Space") as demo:

@@ -53,6 +53,12 @@ HF_SPACE_ID = (
 ).strip()
 HF_API_TOKEN = (os.environ.get("HF_API_TOKEN") or "").strip() or None
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+# Always have a public HTTPS base so Telegram can reach this app.
+WEBHOOK_BASE = (
+    RENDER_EXTERNAL_URL
+    or os.environ.get("WEBHOOK_BASE")
+    or "https://rend-y1aw.onrender.com"
+).strip().rstrip("/")
 
 # Hugging Face Space URL this Render app pings so the Space does not sleep.
 # Format: https://<username>-<space-name>.hf.space
@@ -155,11 +161,21 @@ if not TELEGRAM_BOT_TOKEN:
 _space = None
 
 
+def _wake_space() -> None:
+    """Hit the Space HTTP host so a sleeping replica starts before Gradio Client."""
+    url = (os.environ.get("HF_SPACE_PING_URL") or "https://madarauchihagmailcom-my.hf.space/").strip()
+    try:
+        requests.get(url, timeout=20, headers={"User-Agent": "Rend-Wake/1.0"})
+    except Exception:  # noqa: BLE001
+        logger.debug("Space wake ping failed", exc_info=True)
+
+
 def _client():
     global _space
     if _space is None:
         from gradio_client import Client
 
+        _wake_space()
         logger.info("Connecting to your Space %s …", HF_SPACE_ID)
         try:
             _space = Client(
@@ -171,6 +187,11 @@ def _client():
         except TypeError:
             _space = Client(HF_SPACE_ID, hf_token=HF_API_TOKEN, verbose=False)
     return _space
+
+
+def _reset_client() -> None:
+    global _space
+    _space = None
 
 
 def _as_path(value: Any) -> Optional[str]:
@@ -202,7 +223,12 @@ def _as_text(value: Any) -> str:
 
 
 def _predict(*args, api_name: str):
-    return _client().predict(*args, api_name=api_name)
+    try:
+        return _client().predict(*args, api_name=api_name)
+    except Exception:
+        logger.warning("Space call failed (%s); reconnecting once", api_name, exc_info=True)
+        _reset_client()
+        return _client().predict(*args, api_name=api_name)
 
 
 def call_caption(image_path: str) -> str:
@@ -253,8 +279,36 @@ def call_imagine(prompt: str) -> tuple[str, str]:
     return path, text
 
 
+def _lyrics_direct(query: str) -> str:
+    """lrclib lookup on Render if the Space /lyrics endpoint is down."""
+    q = (query or "").strip()[:200]
+    if not q:
+        return "Type a song name."
+    url = "https://lrclib.net/api/search?q=" + requests.utils.quote(q)
+    resp = requests.get(url, timeout=20, headers={"User-Agent": "ImageBot/1.0"})
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, list) or not data:
+        return f"No lyrics found for “{q}”."
+    for item in data:
+        body = (item or {}).get("plainLyrics") or (item or {}).get("syncedLyrics")
+        if not body:
+            continue
+        track = item.get("trackName") or q
+        artist = item.get("artistName") or "Unknown"
+        out = f"🎵 {track} — {artist}\n\n{body}"
+        return out if len(out) < 8000 else out[:7900] + "\n\n…"
+    return f"No lyrics found for “{q}”."
+
+
 def call_lyrics(query: str) -> str:
-    text = _as_text(_predict(query, api_name="/lyrics"))
+    try:
+        text = _as_text(_predict(query, api_name="/lyrics"))
+        if text:
+            return text
+    except Exception:
+        logger.warning("Space /lyrics failed; using lrclib on Render", exc_info=True)
+    text = _lyrics_direct(query)
     if not text:
         raise RuntimeError("No lyrics came back")
     return text
@@ -501,6 +555,7 @@ async def _run_prompt(
     try:
         if mode == "chat":
             await message.chat.send_action(action="typing")
+            await message.reply_text("চিন্তা করছি… প্রথমবার মডেল লোড হতে পারে।", reply_markup=MENU_KEYBOARD)
             packed = prompt
             hist: list = []
             if context is not None:
@@ -731,18 +786,42 @@ async def on_startup() -> None:
     except Exception:  # noqa: BLE001
         logger.exception("Could not set bot commands")
     logger.info("Image bot started. space=%s", HF_SPACE_ID)
-    if RENDER_EXTERNAL_URL:
-        logger.info(
-            "Remember to set your webhook to: %s/webhook/%s",
-            RENDER_EXTERNAL_URL,
-            TELEGRAM_BOT_TOKEN,
+    webhook_url = f"{WEBHOOK_BASE}/webhook/{TELEGRAM_BOT_TOKEN}"
+    webhook_ok = False
+    try:
+        await telegram_app.bot.set_webhook(
+            url=webhook_url,
+            drop_pending_updates=True,
+            allowed_updates=["message", "callback_query"],
         )
+        info = await telegram_app.bot.get_webhook_info()
+        webhook_ok = bool(info.url)
+        logger.info("Webhook set url=%s pending=%s", info.url, info.pending_update_count)
+        print(f"[webhook] set {info.url} pending={info.pending_update_count}", flush=True)
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not set Telegram webhook")
+    if not webhook_ok:
+        # Render URL missing / Telegram rejected webhook → poll so the bot still answers.
+        try:
+            await telegram_app.bot.delete_webhook(drop_pending_updates=True)
+            if telegram_app.updater:
+                await telegram_app.updater.start_polling(drop_pending_updates=True)
+                logger.info("Webhook failed; polling started")
+                print("[webhook] polling fallback started", flush=True)
+        except Exception:  # noqa: BLE001
+            logger.exception("Polling fallback failed")
     # FastAPI startup: wake the Space in the background (does not block requests).
     _start_keep_alive_thread()
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
+    try:
+        upd = getattr(telegram_app, "updater", None)
+        if upd is not None:
+            await upd.stop()
+    except Exception:  # noqa: BLE001
+        logger.debug("Updater stop failed", exc_info=True)
     await telegram_app.stop()
     await telegram_app.shutdown()
 
@@ -752,7 +831,9 @@ async def health_check():
     return {
         "status": "ok",
         "space": HF_SPACE_ID,
+        "webhook": WEBHOOK_BASE,
         "apis": [
+            "/chat",
             "/imagine",
             "/caption",
             "/ocr",
@@ -760,6 +841,7 @@ async def health_check():
             "/bg",
             "/sketch",
             "/lyrics",
+            "/gitzip",
         ],
     }
 
