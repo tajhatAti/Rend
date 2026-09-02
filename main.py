@@ -17,7 +17,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import requests
 
@@ -225,10 +225,35 @@ def _as_text(value: Any) -> str:
 def _predict(*args, api_name: str):
     try:
         return _client().predict(*args, api_name=api_name)
-    except Exception:
+    except Exception as exc:
+        msg = str(exc).lower()
+        # Quota / auth errors will not recover on retry — don't burn more GPU.
+        if "quota" in msg or "401" in msg or "403" in msg:
+            raise
         logger.warning("Space call failed (%s); reconnecting once", api_name, exc_info=True)
         _reset_client()
         return _client().predict(*args, api_name=api_name)
+
+
+def _friendly_error(exc: BaseException) -> str:
+    msg = str(exc)
+    low = msg.lower()
+    if "zerogpu quota" in low or "exceeded your zerogpu" in low:
+        return (
+            "ZeroGPU কোটা শেষ — আজ Imagine/Chat আর চলবে না।\n"
+            "প্রায় ২৪ ঘণ্টা পর আবার চেষ্টা করুন।\n\n"
+            "কোটা বাড়াতে (ফ্রি):\n"
+            "• Hugging Face Space → Settings → Secret HF_TOKEN\n"
+            "• Render → Environment HF_API_TOKEN = সেই টোকেন\n\n"
+            "এখনও চলবে: Lyrics, GitHub, Refer, No-BG, Sketch।"
+        )
+    if "oserror" in low:
+        return (
+            "Space মডেল লোড করতে পারেনি (ডিস্ক/RAM বা গেটেড মডেল)।\n"
+            "Space Factory reboot + Secret HF_TOKEN দিন।\n"
+            "Lyrics / Git / Refer এখনও চলবে।"
+        )
+    return f"{type(exc).__name__}: {exc}"
 
 
 def call_caption(image_path: str) -> str:
@@ -589,7 +614,7 @@ async def _run_prompt(
     except Exception as exc:  # noqa: BLE001
         logger.exception("Prompt call failed (%s)", mode)
         await message.reply_text(
-            f"Could not finish ({mode}).\n({exc.__class__.__name__}: {exc})",
+            f"Could not finish ({mode}).\n{_friendly_error(exc)}",
             reply_markup=MENU_KEYBOARD,
         )
 
@@ -648,7 +673,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.exception("Space call failed (%s)", mode)
         await update.message.reply_text(
             "Could not finish that request.\n"
-            f"({exc.__class__.__name__}: {exc})",
+            f"{_friendly_error(exc)}",
             reply_markup=MENU_KEYBOARD,
         )
     finally:
@@ -848,6 +873,7 @@ async def health_check():
 
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request):
+    token = unquote(token)
     if token != TELEGRAM_BOT_TOKEN:
         return {"error": "unauthorized"}, 403
     data = await request.json()

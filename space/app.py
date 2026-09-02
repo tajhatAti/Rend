@@ -77,7 +77,7 @@ def _flux():
     )
 
 
-@spaces.GPU
+@spaces.GPU(duration=30)
 def caption(image: Image.Image) -> str:
     if image is None:
         return "No image."
@@ -87,7 +87,7 @@ def caption(image: Image.Image) -> str:
     return str(result)
 
 
-@spaces.GPU
+@spaces.GPU(duration=30)
 def ocr(image: Image.Image) -> str:
     if image is None:
         return "No image."
@@ -97,7 +97,7 @@ def ocr(image: Image.Image) -> str:
     return processor.batch_decode(ids, skip_special_tokens=True)[0]
 
 
-@spaces.GPU
+@spaces.GPU(duration=30)
 def detect(image: Image.Image):
     if image is None:
         return None, "No image."
@@ -159,7 +159,7 @@ def sketch(image: Image.Image):
     return out.convert("RGB"), "pencil sketch"
 
 
-@spaces.GPU(duration=120)
+@spaces.GPU(duration=60)
 def imagine(prompt: str):
     text = (prompt or "").strip()
     if not text:
@@ -174,8 +174,8 @@ def imagine(prompt: str):
         guidance_scale=0.0,
         num_inference_steps=4,
         max_sequence_length=256,
-        height=768,
-        width=768,
+        height=512,
+        width=512,
         generator=torch.Generator("cpu").manual_seed(random.randint(1, 2_000_000_000)),
     ).images[0]
     return image, "FLUX.1-schnell"
@@ -256,11 +256,10 @@ def git_zip(repo: str):
     return None, f"Could not download {owner}/{name}. {last}"
 
 
-# Llama 3.2 3B is gated (needs Space secret HF_TOKEN + license). If that
-# fails, fall back to an ungated 1.5B so chat still answers.
+# Default chat is ungated + small so ZeroGPU quota lasts.
+# Set CHAT_MODEL=meta-llama/Llama-3.2-3B-Instruct (and HF_TOKEN) for Llama.
 _CHAT_MODELS = [
-    (os.environ.get("CHAT_MODEL") or "meta-llama/Llama-3.2-3B-Instruct").strip(),
-    "Qwen/Qwen2.5-1.5B-Instruct",
+    (os.environ.get("CHAT_MODEL") or "Qwen/Qwen2.5-1.5B-Instruct").strip(),
 ]
 _chat_pipe = None
 _chat_loaded_id = ""
@@ -303,7 +302,7 @@ def _load_chat():
     raise RuntimeError(f"No chat model loaded: {last_err}")
 
 
-@spaces.GPU(duration=120)
+@spaces.GPU(duration=30)
 def chat(prompt: str) -> str:
     text = (prompt or "").strip()
     if not text:
