@@ -135,7 +135,7 @@ START_HTML = (
     "<b>Image Bot</b>\n"
     "Telegram → Render → আপনার Space → আপনি।\n\n"
     "<b>এআই</b>\n"
-    "💬 Chat — Llama 3.2 3B (দ্রুত, ZeroGPU)\n"
+    "💬 Chat — CPU (কোটা লাগে না)\n"
     "✨ Imagine — FLUX লেখা → ছবি\n\n"
     "<b>অন্যান্য</b>\n"
     "🎵 Lyrics · 📁 GitHub ZIP · 💸 Refer\n"
@@ -144,7 +144,7 @@ START_HTML = (
 )
 
 MODE_HINT = {
-    "chat": "কথা বলুন। Llama 3.2 3B উত্তর দেবে।\n/imagine দিলে ছবি মোডে যাবে।",
+    "chat": "কথা বলুন। CPU চ্যাট — ZeroGPU কোটা লাগে না।\n/imagine দিলে ছবি মোডে যাবে।",
     "imagine": "একটা প্রম্পট পাঠান।\nযেমন: a tea stall in Rangpur rain, cinematic",
     "lyrics": "গানের নাম পাঠান।\nযেমন: Shape of You",
     "git": "GitHub রিপো পাঠান।\nযেমন: tajhatAti/Lyr",
@@ -240,12 +240,10 @@ def _friendly_error(exc: BaseException) -> str:
     low = msg.lower()
     if "zerogpu quota" in low or "exceeded your zerogpu" in low:
         return (
-            "ZeroGPU কোটা শেষ — আজ Imagine/Chat আর চলবে না।\n"
-            "প্রায় ২৪ ঘণ্টা পর আবার চেষ্টা করুন।\n\n"
-            "কোটা বাড়াতে (ফ্রি):\n"
-            "• Hugging Face Space → Settings → Secret HF_TOKEN\n"
-            "• Render → Environment HF_API_TOKEN = সেই টোকেন\n\n"
-            "এখনও চলবে: Lyrics, GitHub, Refer, No-BG, Sketch।"
+            "ZeroGPU কোটা শেষ — আজ Imagine/Caption/OCR চলবে না।\n"
+            "প্রায় ২৪ ঘণ্টা পর, অথবা HF_TOKEN দিন।\n"
+            "Chat CPU — Space app.py আপডেট হলে চ্যাট চলবে।\n"
+            "Lyrics, Git, Refer, No-BG, Sketch এখনও চলবে।"
         )
     if "oserror" in low:
         return (
@@ -837,6 +835,7 @@ async def on_startup() -> None:
             logger.exception("Polling fallback failed")
     # FastAPI startup: wake the Space in the background (does not block requests).
     _start_keep_alive_thread()
+    threading.Thread(target=_sync_space_from_render, daemon=True, name="space-sync").start()
 
 
 @app.on_event("shutdown")
@@ -851,7 +850,35 @@ async def on_shutdown() -> None:
     await telegram_app.shutdown()
 
 
-@app.get("/")
+def _sync_space_from_render() -> None:
+    """Push ./space to the Hugging Face Space so GPU/chat fixes actually go live."""
+    token = HF_API_TOKEN
+    space_dir = Path(__file__).resolve().parent / "space"
+    if not token:
+        logger.info("No HF_API_TOKEN — cannot auto-sync Space files")
+        return
+    if not space_dir.is_dir():
+        logger.info("No space/ folder on Render — skip HF sync")
+        return
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=token)
+        api.upload_folder(
+            folder_path=str(space_dir),
+            repo_id=HF_SPACE_ID,
+            repo_type="space",
+            commit_message="sync space from Render (CPU chat, short GPU)",
+            allow_patterns=["*.py", "*.txt", "*.md"],
+            ignore_patterns=["**/__pycache__/**", "**/*.pyc"],
+        )
+        logger.info("Synced space/ → https://huggingface.co/spaces/%s", HF_SPACE_ID)
+        print(f"[space-sync] uploaded {space_dir} → {HF_SPACE_ID}", flush=True)
+    except Exception:  # noqa: BLE001
+        logger.exception("Space auto-sync failed")
+
+
+@app.api_route("/", methods=["GET", "HEAD"])
 async def health_check():
     return {
         "status": "ok",

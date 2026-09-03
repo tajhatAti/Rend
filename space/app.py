@@ -77,7 +77,7 @@ def _flux():
     )
 
 
-@spaces.GPU(duration=30)
+@spaces.GPU(duration=20)
 def caption(image: Image.Image) -> str:
     if image is None:
         return "No image."
@@ -87,7 +87,7 @@ def caption(image: Image.Image) -> str:
     return str(result)
 
 
-@spaces.GPU(duration=30)
+@spaces.GPU(duration=20)
 def ocr(image: Image.Image) -> str:
     if image is None:
         return "No image."
@@ -97,7 +97,7 @@ def ocr(image: Image.Image) -> str:
     return processor.batch_decode(ids, skip_special_tokens=True)[0]
 
 
-@spaces.GPU(duration=30)
+@spaces.GPU(duration=20)
 def detect(image: Image.Image):
     if image is None:
         return None, "No image."
@@ -159,26 +159,29 @@ def sketch(image: Image.Image):
     return out.convert("RGB"), "pencil sketch"
 
 
-@spaces.GPU(duration=60)
+@spaces.GPU(duration=20)
 def imagine(prompt: str):
     text = (prompt or "").strip()
     if not text:
         return None, "Type a prompt."
-    import torch
+    try:
+        import torch
 
-    pipe = _flux()
-    if torch.cuda.is_available():
-        pipe.to("cuda")
-    image = pipe(
-        text[:500],
-        guidance_scale=0.0,
-        num_inference_steps=4,
-        max_sequence_length=256,
-        height=512,
-        width=512,
-        generator=torch.Generator("cpu").manual_seed(random.randint(1, 2_000_000_000)),
-    ).images[0]
-    return image, "FLUX.1-schnell"
+        pipe = _flux()
+        if torch.cuda.is_available():
+            pipe.to("cuda")
+        image = pipe(
+            text[:500],
+            guidance_scale=0.0,
+            num_inference_steps=4,
+            max_sequence_length=256,
+            height=512,
+            width=512,
+            generator=torch.Generator("cpu").manual_seed(random.randint(1, 2_000_000_000)),
+        ).images[0]
+        return image, "FLUX.1-schnell"
+    except Exception as exc:  # noqa: BLE001
+        return None, f"Imagine failed: {type(exc).__name__}: {exc}"
 
 
 def lyrics(query: str) -> str:
@@ -256,10 +259,10 @@ def git_zip(repo: str):
     return None, f"Could not download {owner}/{name}. {last}"
 
 
-# Default chat is ungated + small so ZeroGPU quota lasts.
-# Set CHAT_MODEL=meta-llama/Llama-3.2-3B-Instruct (and HF_TOKEN) for Llama.
+# Chat runs on CPU (no @spaces.GPU) so ZeroGPU quota does not block it.
+# Tiny ungated model. Override with CHAT_MODEL if you want something else.
 _CHAT_MODELS = [
-    (os.environ.get("CHAT_MODEL") or "Qwen/Qwen2.5-1.5B-Instruct").strip(),
+    (os.environ.get("CHAT_MODEL") or "Qwen/Qwen2.5-0.5B-Instruct").strip(),
 ]
 _chat_pipe = None
 _chat_loaded_id = ""
@@ -281,19 +284,19 @@ def _load_chat():
             kwargs = {
                 "task": "text-generation",
                 "model": model_id,
-                "torch_dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-                "device_map": "cuda" if torch.cuda.is_available() else "cpu",
+                "torch_dtype": torch.float32,
+                "device_map": "cpu",
             }
             if token:
                 kwargs["token"] = token
-            print(f"[chat] loading {model_id}", flush=True)
+            print(f"[chat] loading CPU {model_id}", flush=True)
             pipe = pipeline(**kwargs)
             tok = getattr(pipe, "tokenizer", None)
             if tok is not None and getattr(tok, "pad_token", None) is None:
                 tok.pad_token = tok.eos_token
             _chat_pipe = pipe
             _chat_loaded_id = model_id
-            print(f"[chat] ready {model_id}", flush=True)
+            print(f"[chat] ready CPU {model_id}", flush=True)
             return _chat_pipe
         except Exception as exc:  # noqa: BLE001
             last_err = exc
@@ -302,8 +305,8 @@ def _load_chat():
     raise RuntimeError(f"No chat model loaded: {last_err}")
 
 
-@spaces.GPU(duration=30)
 def chat(prompt: str) -> str:
+    """CPU chat — does not use ZeroGPU quota."""
     text = (prompt or "").strip()
     if not text:
         return "Type a message."
@@ -324,7 +327,7 @@ def chat(prompt: str) -> str:
             packed = f"User: {text}\nAssistant:"
         out = pipe(
             packed,
-            max_new_tokens=160,
+            max_new_tokens=96,
             do_sample=False,
             return_full_text=False,
         )
@@ -336,8 +339,7 @@ def chat(prompt: str) -> str:
                 reply = str(item).strip()
         else:
             reply = str(out).strip()
-        tag = f"\n\n— {_chat_loaded_id}" if _chat_loaded_id else ""
-        return (reply + tag) if reply else "Chat returned empty."
+        return reply or "Chat returned empty."
     except Exception as exc:  # noqa: BLE001 — never 500 the Space
         print(f"[chat] error: {exc}", flush=True)
         return f"Chat failed: {type(exc).__name__}: {exc}"
@@ -346,7 +348,7 @@ def chat(prompt: str) -> str:
 with gr.Blocks(title="Image Bot Space") as demo:
     gr.Markdown(
         "# Image Bot Space\n"
-        "Telegram backend. **Chat:** Llama-3.2-3B-Instruct on ZeroGPU (`/chat`). "
+        "Telegram backend. **Chat:** Qwen2.5-0.5B on CPU (no ZeroGPU quota). "
         "**Imagine:** FLUX.1-schnell. Photo tools + lyrics + GitHub ZIP."
     )
     image = gr.Image(type="pil", label="Image")
@@ -400,7 +402,7 @@ with gr.Blocks(title="Image Bot Space") as demo:
 
     with gr.Tab("Chat"):
         ch_in = gr.Textbox(label="Message", placeholder="কেমন আছো?")
-        ch_out = gr.Textbox(label="Llama 3.2", lines=8)
+        ch_out = gr.Textbox(label="Chat", lines=8)
         ch_btn = gr.Button("Chat")
         ch_btn.click(chat, inputs=ch_in, outputs=ch_out, api_name="chat")
 

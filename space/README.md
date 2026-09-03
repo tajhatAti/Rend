@@ -12,8 +12,8 @@ pinned: false
 Backend for the Telegram bot.
 
 On this ZeroGPU Space:
-- `/chat` — Llama-3.2-3B-Instruct (fast GPU chat)
-- `/imagine` — FLUX.1-schnell (text → image)
+- `/chat` — Qwen2.5-0.5B-Instruct on **CPU** (no ZeroGPU quota)
+- `/imagine` — FLUX.1-schnell (text → image, 20s GPU)
 - `/caption` `/ocr` `/detect` `/bg` `/sketch`
 - `/lyrics` — song name → lrclib.net
 - `/gitzip` — GitHub `owner/repo` → ZIP (max ~40 MB)
